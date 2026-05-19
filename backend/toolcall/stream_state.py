@@ -25,22 +25,27 @@ class StreamingToolCallState:
 
         self._apply_chunk(buffer, content)
 
-        if buffer.emitted or not buffer.name or not self.is_complete_json_object(buffer.args):
+        if buffer.emitted or not buffer.name:
             return []
 
-        parsed_input = json.loads(buffer.args) if buffer.args else {}
+        # Single parse: try json.loads and validate completeness in one step
+        parsed = self._try_parse_complete(buffer.args)
+        if parsed is None:
+            return []
+
         buffer.emitted = True
-        return [{"type": "tool_use", "id": tool_call_id, "name": buffer.name, "input": parsed_input}]
+        return [{"type": "tool_use", "id": tool_call_id, "name": buffer.name, "input": parsed}]
 
     @staticmethod
-    def is_complete_json_object(text: str) -> bool:
+    def _try_parse_complete(text: str) -> dict | None:
+        """Return parsed dict if text is a complete JSON object, else None."""
         if not text:
-            return False
+            return None
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, TypeError, ValueError):
-            return False
-        return isinstance(parsed, dict)
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     def _resolve_tool_call_id(self, event: dict[str, Any]) -> str:
         extra = event.get("extra") or {}

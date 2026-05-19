@@ -33,37 +33,6 @@ def _normalize_tool_name_case(name: str, tool_names: set[str]) -> str:
     return name
 
 
-def _find_tool_use_json(text: str, tool_names: set[str]):
-    i = 0
-    while i < len(text):
-        pos = text.find('{', i)
-        if pos == -1:
-            break
-        depth = 0
-        for j in range(pos, len(text)):
-            if text[j] == '{':
-                depth += 1
-            elif text[j] == '}':
-                depth -= 1
-                if depth == 0:
-                    candidate = text[pos:j + 1]
-                    try:
-                        obj = json.loads(candidate)
-                        if isinstance(obj, dict) and obj.get("type") == "tool_use" and obj.get("name"):
-                            normalized_name = normalize_tool_name(obj.get("name", ""), tool_names)
-                            if normalized_name in tool_names:
-                                obj = dict(obj)
-                                obj["name"] = normalized_name
-                                return pos, obj
-
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                    break
-        i = pos + 1
-
-    return None
-
-
 def _extract_first_xml_tool_call(text: str) -> str | None:
     wrapped_match = re.search(r"<tool_calls>\s*(<tool_call>[\s\S]*?</tool_call>)\s*</tool_calls>", text, re.IGNORECASE)
     if wrapped_match:
@@ -282,17 +251,12 @@ def parse_tool_calls_silent(answer: str, tools: list):
 
 
 def _parse_tool_calls(answer: str, tools: list, *, emit_logs: bool):
-    answer = _normalize_fragmented_tool_call(answer)
     ctx = get_request_context()
     req_tag = f"req={ctx.get('req_id', '-')} chat={ctx.get('chat_id', '-')}"
     if not tools:
         return [{"type": "text", "text": answer}], "end_turn"
     tool_names = {t.get("name") for t in tools if t.get("name")}
     tool_registry = build_tool_name_registry(tool_names)
-
-    def _log_debug(message: str) -> None:
-        if emit_logs:
-            log.debug(message)
 
     def _log_info(message: str) -> None:
         if emit_logs:
@@ -327,100 +291,19 @@ def _parse_tool_calls(answer: str, tools: list, *, emit_logs: bool):
         _log_info(f"[ToolParse] 返回工具块: original={name!r}, normalized={normalized_name!r}, final={cased_name!r}, input={json.dumps(coerced_input, ensure_ascii=False)[:200]}")
         return blocks, "tool_use"
 
-    detailed = parse_tool_calls_detailed(answer, tool_names)
+    parse_answer = answer
+    detailed = parse_tool_calls_detailed(parse_answer, tool_names)
+    if not detailed.get("calls"):
+        normalized_answer = _normalize_fragmented_tool_call(answer)
+        if normalized_answer != answer:
+            parse_answer = normalized_answer
+            detailed = parse_tool_calls_detailed(parse_answer, tool_names)
+
     detailed_calls = cast(list[dict[str, Any]], detailed["calls"])
     if detailed_calls:
         first_call = detailed_calls[0]
         _log_info(f"[ToolParse] ✓ 详细解析格式: source={detailed['source']}, name={first_call['name']!r}, input={json.dumps(first_call['input'], ensure_ascii=False)[:200]}")
         return _make_tool_block(first_call["name"], first_call["input"])
-
-    tc_m = re.search(r'##TOOL_CALL##\s*(.*?)\s*##END_CALL##', answer, re.DOTALL | re.IGNORECASE)
-    if tc_m:
-        try:
-            obj = json.loads(tc_m.group(1))
-            name = obj.get("name", "")
-            inp = obj.get("input", obj.get("args", obj.get("arguments", obj.get("parameters", {}))))
-            if isinstance(inp, str):
-                try:
-                    inp = json.loads(inp)
-                except Exception:
-                    inp = {"value": inp}
-            prefix = answer[:tc_m.start()].strip()
-            _log_info(f"[ToolParse] ✓ ##TOOL_CALL## 格式: name={name!r}, input={str(inp)[:120]}")
-            return _make_tool_block(name, inp, prefix)
-        except (json.JSONDecodeError, ValueError) as e:
-            _log_warning(f"[ToolParse] ##TOOL_CALL## 格式解析失败: {e}, content={tc_m.group(1)[:100]!r}")
-
-    xml_m = re.search(r'<tool_call>\s*(.*?)\s*</tool_call>', answer, re.DOTALL | re.IGNORECASE)
-    if xml_m:
-        try:
-            obj = json.loads(xml_m.group(1))
-            name = obj.get("name", "")
-            inp = obj.get("input", obj.get("args", obj.get("arguments", obj.get("parameters", {}))))
-            if isinstance(inp, str):
-                try:
-                    inp = json.loads(inp)
-                except Exception:
-                    inp = {"value": inp}
-            prefix = answer[:xml_m.start()].strip()
-            _log_info(f"[ToolParse] ✓ XML格式 <tool_call>: name={name!r}, input={str(inp)[:120]}")
-            return _make_tool_block(name, inp, prefix)
-        except (json.JSONDecodeError, ValueError) as e:
-            _log_warning(f"[ToolParse] XML格式解析失败: {e}, content={xml_m.group(1)[:100]!r}")
-
-    cb_m = re.search(r'```tool_call\s*\n(.*?)\n```', answer, re.DOTALL)
-    if cb_m:
-        try:
-            obj = json.loads(cb_m.group(1).strip())
-            name = obj.get("name", "")
-            inp = obj.get("input", obj.get("args", {}))
-            if isinstance(inp, str):
-                try:
-                    inp = json.loads(inp)
-                except Exception:
-                    inp = {"value": inp}
-            prefix = answer[:cb_m.start()].strip()
-            _log_info(f"[ToolParse] ✓ 代码块格式 tool_call: name={name!r}, input={str(inp)[:120]}")
-            return _make_tool_block(name, inp, prefix)
-        except (json.JSONDecodeError, ValueError) as e:
-            _log_warning(f"[ToolParse] 代码块格式解析失败: {e}")
-
-    stripped = re.sub(r'```json\s*\n?', '', answer)
-    stripped = re.sub(r'\n?```', '', stripped)
-    result = _find_tool_use_json(stripped, tool_names)
-    if result:
-        pos, tool_call = result
-        prefix = stripped[:pos].strip()
-        tool_id = tool_call.get("id") or f"toolu_{uuid.uuid4().hex[:8]}"
-        _log_info(f"[ToolParse] ✓ 旧JSON格式 tool_call: name={tool_call['name']!r}")
-        blocks = []
-        if prefix:
-            blocks.append({"type": "text", "text": prefix})
-        blocks.append({
-            "type": "tool_use",
-            "id": tool_id,
-            "name": tool_call["name"],
-            "input": _coerce_tool_input(tool_call["name"], tool_call.get("input", {}), tools),
-        })
-        return blocks, "tool_use"
-
-    # 尝试解析纯 JSON 格式: {"name": "...", "input": {...}}
-    stripped_clean = stripped.strip()
-    try:
-        if stripped_clean.startswith('{') and stripped_clean.endswith('}'):
-            obj = json.loads(stripped_clean)
-            if isinstance(obj, dict) and "name" in obj:
-                name = obj.get("name", "")
-                inp = obj.get("input", obj.get("args", obj.get("arguments", obj.get("parameters", {}))))
-                if isinstance(inp, str):
-                    try:
-                        inp = json.loads(inp)
-                    except Exception:
-                        inp = {"value": inp}
-                _log_info(f"[ToolParse] ✓ 纯JSON格式: name={name!r}, input={str(inp)[:120]}")
-                return _make_tool_block(name, inp)
-    except (json.JSONDecodeError, ValueError) as e:
-        _log_debug(f"[ToolParse] 纯JSON格式解析失败: {e}, content={stripped_clean[:200]!r}")
 
     _log_warning(f"[ToolParse] ✗ 未检测到工具调用，作为普通文本返回。工具列表: {tool_names}")
     return [{"type": "text", "text": answer}], "end_turn"
@@ -434,7 +317,6 @@ class ToolSieve:
         self.pending = ""
         self.capture = ""
         self.capturing = False
-        self.pending_tool_calls = []
         self.tool_calls_detected = False
 
     def process_chunk(self, chunk: str) -> list[dict]:
@@ -463,7 +345,7 @@ class ToolSieve:
                 if prefix:
                     events.append({"type": "content", "text": prefix})
 
-                self.pending_tool_calls = calls
+                events.append({"type": "tool_calls", "calls": calls})
                 self.tool_calls_detected = True
                 self.pending = suffix
                 self.capture = ""
@@ -497,6 +379,7 @@ class ToolSieve:
         markers = [
             '{"tool_calls"',
             '{"name":',
+            '```tool_call',
             '<tool_call>',
             '##TOOL_CALL##',
             'function.name:',
@@ -510,19 +393,25 @@ class ToolSieve:
 
         return min(positions) if positions else -1
 
-    def _consume_tool_capture(self) -> tuple[str, list, str, bool]:
+    def _consume_tool_capture(self, *, force: bool = False) -> tuple[str, list, str, bool]:
         """尝试解析捕获的工具调用"""
         if not self.capture:
             return "", [], "", False
 
+        parse_text, suffix, ready = self._completed_capture()
+        if not force and not ready:
+            return "", [], "", False
+        if not parse_text:
+            parse_text = self.capture
+
         # 尝试解析工具调用
         try:
             # 使用现有的解析逻辑
-            blocks, stop_reason = parse_tool_calls_silent(self.capture,
+            blocks, stop_reason = parse_tool_calls_silent(parse_text,
                 [{"name": name} for name in self.tool_names])
 
             if stop_reason == "tool_use":
-                # 找到工具��用
+                # 找到工具调用
                 tool_blocks = [b for b in blocks if b.get("type") == "tool_use"]
                 if tool_blocks:
                     # 转换为标准格式
@@ -535,12 +424,69 @@ class ToolSieve:
                     text_blocks = [b for b in blocks if b.get("type") == "text"]
                     prefix = text_blocks[0]["text"] if text_blocks else ""
 
-                    return prefix, calls, "", True
+                    return prefix, calls, suffix, True
         except Exception as e:
             log.debug(f"[ToolSieve] 解析失败: {e}")
 
         # 还不完整或解析失败
         return "", [], "", False
+
+    def _completed_capture(self) -> tuple[str, str, bool]:
+        text = self.capture
+        lowered = text.lower()
+
+        if "##tool_call##" in lowered:
+            end_marker = "##END_CALL##"
+            end = text.upper().find(end_marker)
+            if end < 0:
+                return "", "", False
+            split_at = end + len(end_marker)
+            return text[:split_at], text[split_at:], True
+
+        if "<tool_call" in lowered:
+            end = lowered.find("</tool_call>")
+            if end < 0:
+                return "", "", False
+            split_at = end + len("</tool_call>")
+            return text[:split_at], text[split_at:], True
+
+        stripped = text.lstrip()
+        if stripped.startswith("```"):
+            first_end = text.find("```") + 3
+            close = text.find("```", first_end)
+            if close < 0:
+                return "", "", False
+            split_at = close + 3
+            return text[:split_at], text[split_at:], True
+
+        if "function.name:" in text and "function.arguments:" in text:
+            _, arguments_text = text.split("function.arguments:", 1)
+            if self._is_complete_json_object(arguments_text.strip()):
+                return text, "", True
+
+        json_text, suffix = self._split_complete_json_object(text)
+        if json_text:
+            return json_text, suffix, True
+
+        return "", "", False
+
+    @staticmethod
+    def _split_complete_json_object(text: str) -> tuple[str, str]:
+        stripped = text.lstrip()
+        if not stripped.startswith("{"):
+            return "", ""
+        leading = len(text) - len(stripped)
+        try:
+            _, end = json.JSONDecoder().raw_decode(stripped)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return "", ""
+        split_at = leading + end
+        return text[:split_at], text[split_at:]
+
+    @classmethod
+    def _is_complete_json_object(cls, text: str) -> bool:
+        json_text, suffix = cls._split_complete_json_object(text)
+        return bool(json_text) and not suffix.strip()
 
     def _split_safe_content(self, text: str) -> tuple[str, str]:
         """分离安全内容和需要保留的部分"""
@@ -554,13 +500,9 @@ class ToolSieve:
         """刷新剩余内容"""
         events = []
 
-        if self.pending_tool_calls:
-            events.append({"type": "tool_calls", "calls": self.pending_tool_calls})
-            self.pending_tool_calls = []
-
         if self.capturing and self.capture:
             # 尝试最后一次解析
-            prefix, calls, suffix, ready = self._consume_tool_capture()
+            prefix, calls, suffix, ready = self._consume_tool_capture(force=True)
             if ready and calls:
                 if prefix:
                     events.append({"type": "content", "text": prefix})
@@ -580,12 +522,12 @@ class ToolSieve:
 
     def _looks_like_incomplete_tool_call(self, text: str) -> bool:
         """检查文本是否看起来像不完整的工具调用"""
-        markers = ['{"tool_calls"', '{"name":', '<tool_call>', '##TOOL_CALL##', 'function.name:']
+        markers = ['{"tool_calls"', '{"name":', '```tool_call', '<tool_call>', '##TOOL_CALL##', 'function.name:']
         return any(marker in text for marker in markers)
 
     def has_tool_calls(self) -> bool:
         """是否检测到工具调用"""
-        return self.tool_calls_detected or bool(self.pending_tool_calls)
+        return self.tool_calls_detected
 
 
 def inject_format_reminder(prompt: str, tool_name: str, *, client_profile: str = OPENCLAW_OPENAI_PROFILE) -> str:
@@ -619,5 +561,3 @@ def inject_format_reminder(prompt: str, tool_name: str, *, client_profile: str =
     if prompt.endswith("Assistant:"):
         return prompt[: -len("Assistant:")] + reminder + "\nAssistant:"
     return prompt + "\n\n" + reminder + "\nAssistant:"
-
-

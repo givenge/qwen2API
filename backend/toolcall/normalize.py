@@ -4,12 +4,14 @@ import json
 import re
 from typing import Any, Iterable
 
+_RE_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
 
 def _tool_alias_key(value: str) -> str:
     lowered = value.strip().lower()
     if not lowered:
         return ""
-    return re.sub(r"[^a-z0-9]+", "", lowered)
+    return _RE_NON_ALNUM.sub("", lowered)
 
 
 def build_tool_name_registry(allowed_names: Iterable[str]) -> dict[str, str]:
@@ -27,9 +29,12 @@ def build_tool_name_registry(allowed_names: Iterable[str]) -> dict[str, str]:
     return registry
 
 
-def normalize_tool_name(name: str, allowed_names: Iterable[str]) -> str:
+def normalize_tool_name(name: str, allowed_names: Iterable[str], *, _registry: dict[str, str] | None = None) -> str:
     if not isinstance(name, str) or not name:
         return name
+
+    if _registry is not None:
+        return _registry.get(_tool_alias_key(name), name)
 
     allowed_list = [candidate for candidate in allowed_names if candidate]
     if not allowed_list:

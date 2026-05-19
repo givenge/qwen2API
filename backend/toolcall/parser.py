@@ -9,8 +9,11 @@ from backend.toolcall.formats_xml import parse_xml_format
 
 def _has_top_level_json_tool_syntax(text: str) -> bool:
     stripped = text.strip()
+    lowered = stripped.lower()
+    if "##tool_call##" in lowered or "```tool_call" in lowered:
+        return True
     if stripped.startswith("```"):
-        stripped = stripped.removeprefix("```json").removeprefix("```").strip()
+        stripped = stripped.removeprefix("```json").removeprefix("```tool_call").removeprefix("```").strip()
         if stripped.endswith("```"):
             stripped = stripped[:-3].strip()
 

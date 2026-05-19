@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import json
+import asyncio
 import logging
 import time
 import uuid
@@ -75,6 +76,12 @@ async def chat_completions(request: Request):
     context_prepared = await prepare_context_attachments(app=app, payload=req_data, surface="openai", auth_token=token, client_profile=client_profile, existing_attachments=(preprocessed.attachments if preprocessed is not None else None))
     req_data = context_prepared["payload"]
     standard_request = _build_standard_request(req_data, client_profile=client_profile)
+    # 前端控制 thinking：支持布尔值或对象 {"enabled": true}
+    thinking_cfg = req_data.get("thinking")
+    if isinstance(thinking_cfg, bool):
+        standard_request.thinking_enabled = thinking_cfg
+    elif isinstance(thinking_cfg, dict):
+        standard_request.thinking_enabled = bool(thinking_cfg.get("enabled", True))
     if preprocessed is not None:
         standard_request.attachments = preprocessed.attachments
         standard_request.uploaded_file_ids = preprocessed.uploaded_file_ids
@@ -132,6 +139,7 @@ async def chat_completions(request: Request):
                 async with app.state.session_locks.hold(session_key):
                     try:
                         update_request_context(stream_attempt=1)
+                        queue = asyncio.Queue()
                         translator = OpenAIStreamTranslator(
                             completion_id=completion_id,
                             created=created,
@@ -142,41 +150,60 @@ async def chat_completions(request: Request):
                                 RuntimeAttemptState(answer_text=answer_text),
                             ),
                             allowed_tool_names=standard_request.tool_names,
+                            queue=queue,
                         )
 
                         async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
                             translator.on_delta(evt, text_chunk, tool_calls)
 
-                        result = await run_retryable_completion_bridge(
-                            client=client,
-                            standard_request=standard_request,
-                            prompt=prompt,
-                            users_db=users_db,
-                            token=token,
-                            history_messages=history_messages,
-                            max_attempts=request_max_attempts(standard_request),
-                            usage_delta_factory=build_usage_delta_factory(prompt),
-                            allow_after_visible_output=True,
-                            capture_events=False,
-                            on_delta=on_delta,
-                        )
-                        execution = result.execution
-                        directive = result.directive or build_tool_directive(standard_request, execution.state)
-                        assistant_message = build_openai_assistant_history_message(
-                            execution=execution,
-                            request=standard_request,
-                            directive=directive,
-                        )
-                        await persist_session_turn(
-                            app=app,
-                            request=standard_request,
-                            surface="openai",
-                            execution=execution,
-                            assistant_message=assistant_message,
-                        )
-                        final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else execution.state.finish_reason
-                        for chunk in translator.finalize(final_finish_reason):
+                        async def run_bridge():
+                            nonlocal execution, directive, assistant_message, final_finish_reason
+                            result = await run_retryable_completion_bridge(
+                                client=client,
+                                standard_request=standard_request,
+                                prompt=prompt,
+                                users_db=users_db,
+                                token=token,
+                                history_messages=history_messages,
+                                max_attempts=request_max_attempts(standard_request),
+                                usage_delta_factory=build_usage_delta_factory(prompt),
+                                allow_after_visible_output=True,
+                                capture_events=False,
+                                on_delta=on_delta,
+                            )
+                            execution = result.execution
+                            directive = result.directive or build_tool_directive(standard_request, execution.state)
+                            assistant_message = build_openai_assistant_history_message(
+                                execution=execution,
+                                request=standard_request,
+                                directive=directive,
+                            )
+                            await persist_session_turn(
+                                app=app,
+                                request=standard_request,
+                                surface="openai",
+                                execution=execution,
+                                assistant_message=assistant_message,
+                            )
+                            final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else execution.state.finish_reason
+                            # 调用 finalize 以处理任何剩余的工具调用等
+                            translator.finalize(final_finish_reason)
+                            # 放入哨兵值
+                            await queue.put(None)
+
+                        execution = None
+                        directive = None
+                        assistant_message = None
+                        final_finish_reason = None
+                        task = asyncio.create_task(run_bridge())
+                        # 从队列中读取块并 yield
+                        while True:
+                            chunk = await queue.get()
+                            if chunk is None:
+                                break
                             yield chunk
+                        # 等待任务完成
+                        await task
                         return
                     except HTTPException as he:
                         await clear_invalidated_session_chat(app=app, request=standard_request)

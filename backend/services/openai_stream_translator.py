@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Callable
 
@@ -23,6 +24,7 @@ class OpenAIStreamTranslator:
         client_profile: str,
         build_final_directive: Callable[[str], RuntimeToolDirective] | None = None,
         allowed_tool_names: list[str] | None = None,
+        queue: asyncio.Queue | None = None,
     ):
         self.completion_id = completion_id
         self.created = created
@@ -39,6 +41,11 @@ class OpenAIStreamTranslator:
         self.tool_calls_emitted = False
         self.tool_text_detection_mode = self._resolve_tool_text_detection_mode(client_profile)
         self.tool_call_finalize_mode = self._resolve_tool_call_finalize_mode(client_profile)
+        self.queue = queue
+        # 预计算 content/reasoning chunk 的 JSON 前缀和后缀，避免每 chunk 重复构建完整 dict
+        self._chunk_prefix = f'data: {{"id": {json.dumps(completion_id)}, "object": "chat.completion.chunk", "created": {created}, "model": {json.dumps(model_name)}, "choices": [{{"index": 0, "delta": {{"content": '
+        self._chunk_suffix = f'}}, "finish_reason": null}}]}}\n\n'
+        self._reasoning_prefix = f'data: {{"id": {json.dumps(completion_id)}, "object": "chat.completion.chunk", "created": {created}, "model": {json.dumps(model_name)}, "choices": [{{"index": 0, "delta": {{"reasoning_content": '
 
     @staticmethod
     def _resolve_tool_text_detection_mode(client_profile: str) -> str:
@@ -68,10 +75,15 @@ class OpenAIStreamTranslator:
         if any(marker in lowered for marker in common_markers):
             return True
         if self.allowed_tool_names:
+            # 快速前缀检查：避免对普通文本 chunk 调用昂贵的 parse_tool_calls_detailed
+            stripped = text_chunk.lstrip()
+            first_char = stripped[:1] if stripped else ""
+            # 只有以工具调用语法常见前缀开头的 chunk 才做详细解析
+            if first_char not in ("{", "[", "`", "<"):
+                return False
             detailed = parse_tool_calls_detailed(text_chunk, self.allowed_tool_names)
             if detailed.get("saw_tool_syntax"):
                 if self.tool_text_detection_mode == "strict_prefix":
-                    stripped = text_chunk.lstrip()
                     return stripped.startswith(STRICT_TOOL_TEXT_PREFIXES)
                 return True
         return False
@@ -93,23 +105,30 @@ class OpenAIStreamTranslator:
             "model": self.model_name,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
         }
-        self.pending_chunks.append(f"data: {json.dumps(yield_payload, ensure_ascii=False)}\n\n")
+        chunk = f"data: {json.dumps(yield_payload, ensure_ascii=False)}\n\n"
+        if self.queue is not None:
+            # 实时流式：将块放入队列
+            self.queue.put_nowait(chunk)
+        else:
+            self.pending_chunks.append(chunk)
         self.role_chunk_sent = True
 
     def _emit_content_chunk(self, text_chunk: str) -> None:
-        chunk = (
-            f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'content': text_chunk}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
-        )
-        self.pending_chunks.append(chunk)
+        chunk = f"{self._chunk_prefix}{json.dumps(text_chunk, ensure_ascii=False)}{self._chunk_suffix}"
+        if self.queue is not None:
+            self.queue.put_nowait(chunk)
+        else:
+            self.pending_chunks.append(chunk)
         self.pending_content_chunks.append(chunk)
 
     def _emit_reasoning_chunk(self, text_chunk: str) -> None:
         """把 Qwen 的思考内容以 DeepSeek R1 风格 reasoning_content 发出去，
         让网页端/客户端能显示推理过程。"""
-        chunk = (
-            f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'reasoning_content': text_chunk}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
-        )
-        self.pending_chunks.append(chunk)
+        chunk = f"{self._reasoning_prefix}{json.dumps(text_chunk, ensure_ascii=False)}{self._chunk_suffix}"
+        if self.queue is not None:
+            self.queue.put_nowait(chunk)
+        else:
+            self.pending_chunks.append(chunk)
 
     def _discard_pending_content_chunks(self) -> None:
         if not self.pending_content_chunks:
@@ -145,9 +164,11 @@ class OpenAIStreamTranslator:
         for tool_call in tool_calls:
             idx = self.emitted_tool_index
             self.emitted_tool_index += 1
-            self.pending_chunks.append(
-                f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': idx, 'id': tool_call['id'], 'type': 'function', 'function': {'name': tool_call['name'], 'arguments': json.dumps(tool_call['input'], ensure_ascii=False)}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
-            )
+            chunk = f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': idx, 'id': tool_call['id'], 'type': 'function', 'function': {'name': tool_call['name'], 'arguments': json.dumps(tool_call['input'], ensure_ascii=False)}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+            if self.queue is not None:
+                self.queue.put_nowait(chunk)
+            else:
+                self.pending_chunks.append(chunk)
         if tool_calls:
             self.tool_calls_emitted = True
 
@@ -175,9 +196,16 @@ class OpenAIStreamTranslator:
         elif buffered_text and not self.tool_calls_emitted:
             self._emit_content_chunk(buffered_text)
 
-        chunks = list(self.pending_chunks)
-        chunks.append(
-            f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': final_finish_reason}]}, ensure_ascii=False)}\n\n"
-        )
-        chunks.append("data: [DONE]\n\n")
-        return chunks
+        if self.queue is not None:
+            # 实时流式：将结束块放入队列
+            end_chunk = f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': final_finish_reason}]}, ensure_ascii=False)}\n\n"
+            self.queue.put_nowait(end_chunk)
+            self.queue.put_nowait("data: [DONE]\n\n")
+            return []
+        else:
+            chunks = list(self.pending_chunks)
+            chunks.append(
+                f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': final_finish_reason}]}, ensure_ascii=False)}\n\n"
+            )
+            chunks.append("data: [DONE]\n\n")
+            return chunks

@@ -36,3 +36,4 @@ class StandardRequest:
     persistent_session: bool = False
     session_message_hashes: list[str] = field(default_factory=list)
     session_chat_invalidated: bool = False
+    thinking_enabled: bool | None = None  # None=用全局默认, True/False=前端显式控制

@@ -100,29 +100,21 @@ class QwenExecutor:
         content: str,
         has_custom_tools: bool = False,
         files: list[dict] | None = None,
+        thinking_enabled: bool | None = None,
     ):
         stream_fn = getattr(self.engine, "stream_chat_once", None) or getattr(self.engine, "fetch_chat", None)
         if stream_fn is None:
             raise Exception("stream transport unavailable")
 
-        payload = build_chat_payload(chat_id, model, content, has_custom_tools, files=files)
+        payload = build_chat_payload(chat_id, model, content, has_custom_tools, files=files, thinking_enabled=thinking_enabled)
         buffer = ""
         started_at = time.perf_counter()
         first_event_logged = False
         last_chunk_time = time.perf_counter()
         total_output_chars = 0  # 方案4：统计输出字符数
 
-        feature_config = payload.get("messages", [{}])[0].get("feature_config", {})
         prompt_len = len(content)
-        log.info(f"[上游] 开始流式 会话={chat_id} 模型={model} 自定义工具={has_custom_tools} prompt长度={prompt_len} ({prompt_len/1024:.1f}KB)")
-        log.info(f"[上游] 功能配置: function_calling={feature_config.get('function_calling')} auto_search={feature_config.get('auto_search')} code_interpreter={feature_config.get('code_interpreter')} plugins_enabled={feature_config.get('plugins_enabled')}")
-
-        prompt_content = payload.get("messages", [{}])[0].get("content", "")
-        if "##TOOL_CALL##" in prompt_content:
-            log.info(f"[上游] prompt 包含 ##TOOL_CALL## 标记（正常）")
-        else:
-            log.warning(f"[上游] prompt 缺少 ##TOOL_CALL## 标记 — 可能导致上游拦截")
-        log.info(f"[上游] prompt 前 500 字预览: {prompt_content[:500]}")
+        log.info(f"[上游] 开始流式 会话={chat_id} 模型={model} 工具={has_custom_tools} prompt={prompt_len}B")
 
         try:
             async for chunk_result in stream_fn(token, chat_id, payload):
@@ -181,6 +173,7 @@ class QwenExecutor:
         files: list[dict] | None = None,
         fixed_account=None,
         existing_chat_id: str | None = None,
+        thinking_enabled: bool | None = None,
     ):
         exclude = set()
         if fixed_account is not None:
@@ -195,7 +188,7 @@ class QwenExecutor:
                 else:
                     log.info(f"[上游] 创建会话 会话={chat_id} 账号={acc.email}")
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
-                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
+                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files, thinking_enabled=thinking_enabled):
                     yield {"type": "event", "event": evt}
                 return
             except Exception:
@@ -211,15 +204,14 @@ class QwenExecutor:
                 raise Exception("No available accounts in pool (all busy or rate limited)")
 
             try:
-                log.info(f"[上游] 账号已获取 账号={acc.email} 模型={model} 第{attempt + 1}次 获取耗时={acquire_elapsed:.3f}s")
                 create_start = time.perf_counter()
                 chat_id = await self.create_chat(acc.token, model)
                 create_elapsed = time.perf_counter() - create_start
                 update_request_context(chat_id=chat_id)
-                log.info(f"[上游] 创建会话 会话={chat_id} 账号={acc.email} 耗时={create_elapsed:.3f}s")
+                log.info(f"[上游] 就绪 账号={acc.email} 会话={chat_id} 获取={acquire_elapsed:.2f}s 创建={create_elapsed:.2f}s")
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
 
-                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
+                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files, thinking_enabled=thinking_enabled):
                     yield {"type": "event", "event": evt}
                 return
 

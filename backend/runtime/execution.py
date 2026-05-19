@@ -495,6 +495,7 @@ async def collect_completion_run(
         files=getattr(request, "upstream_files", None),
         fixed_account=getattr(request, "bound_account", None),
         existing_chat_id=getattr(request, "upstream_chat_id", None),
+        thinking_enabled=getattr(request, "thinking_enabled", None),
     ):
         if item.get("type") == "meta":
             chat_id = item.get("chat_id")
@@ -550,7 +551,8 @@ async def collect_completion_run(
                 metrics.mark("first_event", float(len(raw_events)))
                 first_event_marked = True
 
-            # Tool Sieve 实时检测
+            # Tool Sieve 需要看到连续 chunk 才能识别被拆开的工具标记；
+            # 内部只在捕获完整候选片段后才调用完整 parser。
             if tool_sieve:
                 sieve_events = tool_sieve.process_chunk(content)
                 for sieve_evt in sieve_events:
@@ -576,10 +578,13 @@ async def collect_completion_run(
                 await on_delta(evt, content, None)
             if request.tools:
                 answer_text = "".join(answer_fragments)
-                if len(answer_fragments) % 3 == 0 or "does not exist" in content.lower():
+                # 降低检测频率：每 8 个 chunk 检测一次 blocked tool（而非每 3 个）
+                # "does not exist" 关键字仍做即时检测
+                if len(answer_fragments) % 8 == 0 or "does not exist" in content.lower():
                     blocked_tool_names = extract_blocked_tool_names(answer_text.strip(), request.tool_names)
                     if blocked_tool_names:
                         return _finalize_result(reason=f"blocked_tool_name:{blocked_tool_names[0]}")
+                # 仅在文本包含工具标记时才做解析
                 if "##TOOL_CALL##" in answer_text or "<tool_call>" in answer_text:
                     directive = parse_tool_directive_once(
                         request,
@@ -1028,7 +1033,7 @@ async def continue_after_retry_directive(*, client, execution, retry: RuntimeRet
         return RuntimeRetryContinuation(should_continue=False, next_prompt=retry.next_prompt)
     await cleanup_runtime_resources(client, execution.acc, execution.chat_id, preserve_chat=preserve_chat)
     if not preserve_chat:
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.05)
     return RuntimeRetryContinuation(should_continue=True, next_prompt=retry.next_prompt)
 
 

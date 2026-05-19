@@ -1,13 +1,13 @@
 services:
   qwen2api:
-    image: ${QWEN2API_IMAGE:-yujunzhixue/qwen2api:latest}
+    image: ${QWEN2API_IMAGE:-qwen2api:arm}
     container_name: qwen2api
     restart: unless-stopped
     env_file:
       - path: .env
         required: false
     ports:
-      - "7860:7860"
+      - "3008:7860"
     volumes:
       - ./data:/workspace/data
       - ./logs:/workspace/logs

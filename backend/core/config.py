@@ -108,6 +108,8 @@ MODEL_MAP = {
     # DeepSeek
     "deepseek-chat":     "qwen3.6-plus",
     "deepseek-reasoner": "qwen3.6-plus",
+    "qwen3.7-max-preview": "qwen3.7-max-preview",
+    "qwen3.7-plus-preview": "qwen3.7-plus-preview",
 }
 
 def resolve_model(name: str) -> str:

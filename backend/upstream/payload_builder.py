@@ -1,36 +1,40 @@
+import os
 import time
 import uuid
 
+# 默认关闭 thinking 以降低首字时延（thinking 阶段可消耗 10-30s）。
+# 设置 THINKING_ENABLED=true 环境变量可重新开启。
+_THINKING_ENABLED = os.getenv("THINKING_ENABLED", "false").lower() in ("true", "1", "yes")
 
-CUSTOM_TOOL_COMPAT_FEATURE_CONFIG = {
-    "thinking_enabled": True,
+_BASE_FEATURE_CONFIG = {
     "output_schema": "phase",
     "research_mode": "normal",
-    "auto_thinking": True,
-    "thinking_mode": "Auto",
     "thinking_format": "summary",
     "auto_search": False,
     "code_interpreter": False,
     "plugins_enabled": False,
 }
 
-CUSTOM_TOOL_LOW_LATENCY_OVERRIDES = {
-    "thinking_enabled": False,
-    "auto_thinking": False,
-}
 
-
-def build_chat_payload(chat_id: str, model: str, content: str, has_custom_tools: bool = False, files: list[dict] | None = None) -> dict:
+def build_chat_payload(chat_id: str, model: str, content: str, has_custom_tools: bool = False, files: list[dict] | None = None, thinking_enabled: bool | None = None) -> dict:
     ts = int(time.time())
+    # thinking 优先级：工具请求强制关闭 > 前端显式值 > 全局默认
+    if has_custom_tools:
+        effective_thinking = False
+    elif thinking_enabled is not None:
+        effective_thinking = thinking_enabled
+    else:
+        effective_thinking = _THINKING_ENABLED
     feature_config = {
-        **CUSTOM_TOOL_COMPAT_FEATURE_CONFIG,
-        **(CUSTOM_TOOL_LOW_LATENCY_OVERRIDES if has_custom_tools else {}),
+        **_BASE_FEATURE_CONFIG,
+        "thinking_enabled": effective_thinking,
+        "auto_thinking": effective_thinking,
+        "thinking_mode": "Auto" if effective_thinking else "disabled",
         # Our Anthropic/OpenAI bridge relies on textual JSON/XML tool directives
         # that are parsed locally. Enabling Qwen native function_calling here causes
         # upstream interception such as `Tool Read/Bash does not exists.` for custom
         # local tools that only exist in the bridge layer.
         "function_calling": False,
-        # Additional safeguards to prevent tool call interception
         "enable_tools": False,
         "enable_function_call": False,
         "tool_choice": "none",

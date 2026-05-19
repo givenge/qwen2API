@@ -162,8 +162,8 @@ class QwenClient:
     def parse_sse_chunk(self, chunk: str) -> list[dict]:
         return parse_sse_chunk(chunk)
 
-    async def stream(self, token: str, chat_id: str, model: str, content: str, has_custom_tools: bool = False, files: list[dict] | None = None):
-        async for event in self.executor.stream(token, chat_id, model, content, has_custom_tools, files=files):
+    async def stream(self, token: str, chat_id: str, model: str, content: str, has_custom_tools: bool = False, files: list[dict] | None = None, thinking_enabled: bool | None = None):
+        async for event in self.executor.stream(token, chat_id, model, content, has_custom_tools, files=files, thinking_enabled=thinking_enabled):
             yield event
 
     async def stream_chat_once(self, token: str, chat_id: str, payload: dict) -> AsyncIterator[dict]:
@@ -191,6 +191,7 @@ class QwenClient:
         files: list[dict] | None = None,
         fixed_account=None,
         existing_chat_id: str | None = None,
+        thinking_enabled: bool | None = None,
     ):
         async for item in self.executor.chat_stream_events_with_retry(
             model,
@@ -199,5 +200,6 @@ class QwenClient:
             files=files,
             fixed_account=fixed_account,
             existing_chat_id=existing_chat_id,
+            thinking_enabled=thinking_enabled,
         ):
             yield item

@@ -18,8 +18,8 @@ import re
 from typing import Callable, Optional
 
 
-_DEFAULT_WARMUP = 96
-_DEFAULT_GUARD = 256
+_DEFAULT_WARMUP = 16
+_DEFAULT_GUARD = 32
 _START_BOUNDARY = re.compile(r"[\n。！？.!?]")
 _HTML_TOKEN_RE = re.compile(r"(</?[a-z][a-z0-9]*\s*/?>|&[a-z]+;)", re.IGNORECASE)
 _HTML_VALID_RATIO_MIN = 0.2

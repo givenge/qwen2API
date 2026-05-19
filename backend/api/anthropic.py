@@ -242,6 +242,12 @@ async def anthropic_messages(request: Request):
         )
         working_payload = context_prepared["payload"]
         standard_request = _build_standard_request(working_payload)
+        # 前端控制 thinking：Anthropic 格式 {"thinking": {"type": "enabled", "budget_tokens": N}}
+        thinking_cfg = working_payload.get("thinking")
+        if isinstance(thinking_cfg, dict):
+            standard_request.thinking_enabled = thinking_cfg.get("type") == "enabled"
+        elif isinstance(thinking_cfg, bool):
+            standard_request.thinking_enabled = thinking_cfg
         if preprocessed is not None:
             standard_request.attachments = preprocessed.attachments
             standard_request.uploaded_file_ids = preprocessed.uploaded_file_ids
@@ -327,8 +333,8 @@ async def anthropic_messages(request: Request):
                                 capture_events=False,
                                 on_delta=on_delta,
                                 max_continuation=2,
-                                warmup_chars=64,
-                                guard_chars=96,
+                                warmup_chars=16,
+                                guard_chars=32,
                             )
                             retry = evaluate_retry_directive(
                                 request=standard_request,
