@@ -17,6 +17,14 @@ log = logging.getLogger("qwen2api.tool_parser")
 
 
 CASE_SENSITIVE_TOOL_NAMES = {"Bash", "Edit", "Write", "Read", "Grep", "Glob", "WebFetch", "WebSearch"}
+TOOL_START_MARKERS = (
+    '{"tool_calls"',
+    '{"name":',
+    '```tool_call',
+    '<tool_call>',
+    '##TOOL_CALL##',
+    'function.name:',
+)
 
 
 def _normalize_tool_name_case(name: str, tool_names: set[str]) -> str:
@@ -385,18 +393,10 @@ class ToolSieve:
 
     def _find_tool_start(self, text: str) -> int:
         """查找工具调用开始位置"""
-        markers = [
-            '{"tool_calls"',
-            '{"name":',
-            '```tool_call',
-            '<tool_call>',
-            '##TOOL_CALL##',
-            'function.name:',
-        ]
-
+        lowered = text.lower()
         positions = []
-        for marker in markers:
-            pos = text.find(marker)
+        for marker in TOOL_START_MARKERS:
+            pos = lowered.find(marker.lower())
             if pos >= 0:
                 positions.append(pos)
 
@@ -513,11 +513,23 @@ class ToolSieve:
 
     def _split_safe_content(self, text: str) -> tuple[str, str]:
         """分离安全内容和需要保留的部分"""
-        # 保留最后几个字符，防止工具调用标记被截断
-        if len(text) < 20:
-            return "", text
+        hold_len = self._partial_marker_suffix_len(text)
+        if hold_len:
+            return text[:-hold_len], text[-hold_len:]
 
-        return text[:-10], text[-10:]
+        return text, ""
+
+    @staticmethod
+    def _partial_marker_suffix_len(text: str) -> int:
+        lowered = text.lower()
+        longest = 0
+        for marker in TOOL_START_MARKERS:
+            marker = marker.lower()
+            max_prefix_len = min(len(marker) - 1, len(lowered))
+            for prefix_len in range(1, max_prefix_len + 1):
+                if lowered.endswith(marker[:prefix_len]):
+                    longest = max(longest, prefix_len)
+        return longest
 
     def flush(self) -> list[dict]:
         """刷新剩余内容"""
@@ -545,8 +557,8 @@ class ToolSieve:
 
     def _looks_like_incomplete_tool_call(self, text: str) -> bool:
         """检查文本是否看起来像不完整的工具调用"""
-        markers = ['{"tool_calls"', '{"name":', '```tool_call', '<tool_call>', '##TOOL_CALL##', 'function.name:']
-        return any(marker in text for marker in markers)
+        lowered = text.lower()
+        return any(marker.lower() in lowered for marker in TOOL_START_MARKERS)
 
     def has_tool_calls(self) -> bool:
         """是否检测到工具调用"""

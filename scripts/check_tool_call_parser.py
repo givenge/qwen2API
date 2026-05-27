@@ -95,6 +95,15 @@ class ToolCallParserTests(unittest.TestCase):
 
         self.assertEqual(events, [{"type": "tool_calls", "calls": [{"name": "Bash", "input": {"command": "ls -la"}}]}])
 
+    def test_tool_sieve_holds_split_marker_after_long_prefix(self):
+        sieve = tool_parser.ToolSieve(["Bash"])
+        prefix = "x" * 30
+
+        self.assertEqual(sieve.process_chunk(prefix + "##TOOL_CALL"), [{"type": "content", "text": prefix}])
+        events = sieve.process_chunk('##\n{"name": "shell_run", "input": {"command": "ls -la"}}')
+
+        self.assertEqual(events, [{"type": "tool_calls", "calls": [{"name": "Bash", "input": {"command": "ls -la"}}]}])
+
 
 if __name__ == "__main__":
     unittest.main()

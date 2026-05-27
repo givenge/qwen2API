@@ -551,9 +551,12 @@ async def collect_completion_run(
                 metrics.mark("first_event", float(len(raw_events)))
                 first_event_marked = True
 
-            # Tool Sieve 需要看到连续 chunk 才能识别被拆开的工具标记；
-            # 内部只在捕获完整候选片段后才调用完整 parser。
+            client_text_chunks = [content]
+
+            # Tool Sieve 需要看到连续 chunk 才能识别被拆开的工具标记。
+            # 当启用时，只把它判定安全的 content 片段流给客户端，避免半截 marker 泄露。
             if tool_sieve:
+                client_text_chunks = []
                 sieve_events = tool_sieve.process_chunk(content)
                 for sieve_evt in sieve_events:
                     if sieve_evt.get("type") == "tool_calls":
@@ -573,9 +576,11 @@ async def collect_completion_run(
                                 [c.get("name") for c in detected_calls],
                             )
                             return _finalize_result(reason="tool_sieve_detected")
+                    elif sieve_evt.get("type") == "content":
+                        safe_text = sieve_evt.get("text", "")
+                        if safe_text:
+                            client_text_chunks.append(safe_text)
 
-            if on_delta is not None:
-                await on_delta(evt, content, None)
             if request.tools:
                 answer_text = "".join(answer_fragments)
                 # 降低检测频率：每 8 个 chunk 检测一次 blocked tool（而非每 3 个）
@@ -592,6 +597,9 @@ async def collect_completion_run(
                     )
                     if directive.stop_reason == "tool_use":
                         return _finalize_result(reason="textual_tool_use")
+            if on_delta is not None:
+                for client_text in client_text_chunks:
+                    await on_delta(evt, client_text, None)
             continue
 
         if phase == "tool_call":
