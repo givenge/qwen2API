@@ -60,7 +60,7 @@ class ToolCallParserTests(unittest.TestCase):
         self.assertEqual(stop_reason, "end_turn")
         self.assertEqual(blocks, [{"type": "text", "text": "hello there"}])
 
-    def test_tool_sieve_parses_once_after_complete_marker(self):
+    def test_tool_sieve_parses_once_after_complete_marker_json(self):
         calls = []
         original_parser = tool_parser.parse_tool_calls_silent
 
@@ -73,14 +73,27 @@ class ToolCallParserTests(unittest.TestCase):
             sieve = tool_parser.ToolSieve(["Read"])
             self.assertEqual(sieve.process_chunk("before ##TOOL_CALL##\n"), [{"type": "content", "text": "before "}])
             self.assertEqual(sieve.process_chunk('{"name": "Read", '), [])
-            self.assertEqual(sieve.process_chunk('"input": {"file_path": "/tmp/a.txt"}}\n'), [])
-            self.assertEqual(calls, [])
 
-            events = sieve.process_chunk("##END_CALL##")
+            events = sieve.process_chunk('"input": {"file_path": "/tmp/a.txt"}}\n')
             self.assertEqual(len(calls), 1)
             self.assertEqual(events, [{"type": "tool_calls", "calls": [{"name": "Read", "input": {"file_path": "/tmp/a.txt"}}]}])
         finally:
             tool_parser.parse_tool_calls_silent = original_parser
+
+    def test_tool_sieve_accepts_complete_marker_json_without_end_marker(self):
+        sieve = tool_parser.ToolSieve(["Bash"])
+        self.assertEqual(sieve.process_chunk("##TOOL_CALL##\n"), [])
+
+        events = sieve.process_chunk('{"name": "shell_run", "input": {"command": "ls -la"}}')
+
+        self.assertEqual(events, [{"type": "tool_calls", "calls": [{"name": "Bash", "input": {"command": "ls -la"}}]}])
+
+    def test_tool_sieve_accepts_complete_marker_json_in_first_chunk(self):
+        sieve = tool_parser.ToolSieve(["Bash"])
+
+        events = sieve.process_chunk('##TOOL_CALL##\n{"name": "shell_run", "input": {"command": "ls -la"}}')
+
+        self.assertEqual(events, [{"type": "tool_calls", "calls": [{"name": "Bash", "input": {"command": "ls -la"}}]}])
 
 
 if __name__ == "__main__":

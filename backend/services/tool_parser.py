@@ -365,6 +365,15 @@ class ToolSieve:
             self.capture = self.pending[start:]
             self.pending = ""
             self.capturing = True
+            capture_prefix, calls, suffix, ready = self._consume_tool_capture()
+            if ready and calls:
+                if capture_prefix:
+                    events.append({"type": "content", "text": capture_prefix})
+                events.append({"type": "tool_calls", "calls": calls})
+                self.tool_calls_detected = True
+                self.pending = suffix
+                self.capture = ""
+                self.capturing = False
         else:
             # 没找到，输出安全部分
             safe, hold = self._split_safe_content(self.pending)
@@ -439,6 +448,9 @@ class ToolSieve:
             end_marker = "##END_CALL##"
             end = text.upper().find(end_marker)
             if end < 0:
+                json_text, suffix = self._split_complete_json_after_marker(text)
+                if json_text:
+                    return json_text, suffix, True
                 return "", "", False
             split_at = end + len(end_marker)
             return text[:split_at], text[split_at:], True
@@ -481,6 +493,17 @@ class ToolSieve:
         except (json.JSONDecodeError, TypeError, ValueError):
             return "", ""
         split_at = leading + end
+        return text[:split_at], text[split_at:]
+
+    @classmethod
+    def _split_complete_json_after_marker(cls, text: str) -> tuple[str, str]:
+        json_start = text.find("{")
+        if json_start < 0:
+            return "", ""
+        json_text, suffix = cls._split_complete_json_object(text[json_start:])
+        if not json_text:
+            return "", ""
+        split_at = json_start + len(json_text)
         return text[:split_at], text[split_at:]
 
     @classmethod
