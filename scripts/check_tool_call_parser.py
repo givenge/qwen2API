@@ -28,10 +28,12 @@ from backend.runtime.execution import RuntimeAttemptState, RuntimeToolDirective,
 from backend.services import tool_parser
 from backend.services.openai_stream_translator import OpenAIStreamTranslator
 from backend.services.response_formatters import build_openai_completion_payload
+from backend.services.chat_id_pool import ChatIdPool
 from backend.services.standard_request_builder import build_chat_standard_request
 from backend.services.thinking_control import extract_request_thinking_enabled
 from backend.toolcall.parser import parse_tool_calls_detailed
 from backend.upstream.payload_builder import build_chat_payload
+from backend.upstream.sse_consumer import parse_sse_chunk
 
 
 TOOLS = [
@@ -134,8 +136,8 @@ class ToolCallParserTests(unittest.TestCase):
             "qwen-3.6plus-thinking": ("qwen3.6-plus", True),
             "qwen-3.6plus-nonthinking": ("qwen3.6-plus", False),
             "qwen-3.6plus-nonthiking": ("qwen3.6-plus", False),
-            "qwen-3.7max-thinking": ("qwen3.7-max-preview", True),
-            "qwen-3.7max-nonthinking": ("qwen3.7-max-preview", False),
+            "qwen-3.7max-thinking": ("qwen3.7-max", True),
+            "qwen-3.7max-nonthinking": ("qwen3.7-max", False),
         }
         for model, expected in cases.items():
             with self.subTest(model=model):
@@ -191,6 +193,27 @@ class ToolCallParserTests(unittest.TestCase):
 
         self.assertFalse(request.thinking_enabled)
         self.assertFalse(request.model_thinking_enabled)
+
+    def test_chat_id_pool_is_model_scoped_and_prewarm_bypasses_pool(self):
+        async def run_case():
+            calls = []
+
+            class FakeExecutor:
+                async def create_chat(self, token, model, chat_type="t2t", *, use_prewarm_pool=True):
+                    calls.append((token, model, use_prewarm_pool))
+                    return f"chat-{model}"
+
+            fake_client = SimpleNamespace(executor=FakeExecutor())
+            pool = ChatIdPool(fake_client, target_per_account=1, default_model="qwen3.6-plus")
+            account = SimpleNamespace(email="a@example.com", token="tok")
+
+            await pool._prewarm_one(account, "qwen3.6-plus")
+
+            self.assertEqual(calls, [("tok", "qwen3.6-plus", False)])
+            self.assertIsNone(await pool.acquire("a@example.com", "qwen3.7-max-preview"))
+            self.assertEqual(await pool.acquire("a@example.com", "qwen3.6-plus"), "chat-qwen3.6-plus")
+
+        asyncio.run(run_case())
 
     def test_openai_stream_translator_emits_tool_call_delta(self):
         def build_directive(_answer_text):
@@ -325,6 +348,72 @@ class ToolCallParserTests(unittest.TestCase):
             self.assertEqual(streamed[0][0], "thinking_summary")
             self.assertIn("先比较小数位", streamed[0][1])
             self.assertEqual(streamed[-1], ("answer", "9.9"))
+
+        asyncio.run(run_case())
+
+    def test_qwen_thinking_summary_extra_is_parsed_as_reasoning_snapshot(self):
+        raw = (
+            'data: {"choices":[{"delta":{"role":"assistant","phase":"thinking_summary",'
+            '"status":"typing","content":"","extra":{"summary_title":{"content":["比较小数"]},'
+            '"summary_thought":{"content":["先对齐小数位，再比较。"]}}}}]}\n\n'
+        )
+
+        events = parse_sse_chunk(raw)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["phase"], "thinking_summary")
+        self.assertTrue(events[0]["reasoning_snapshot"])
+        self.assertIn("比较小数", events[0]["content"])
+        self.assertIn("先对齐小数位", events[0]["content"])
+
+    def test_reasoning_snapshot_is_not_duplicated(self):
+        async def run_case():
+            class FakeClient:
+                async def chat_stream_events_with_retry(self, *args, **kwargs):
+                    yield {"type": "meta", "chat_id": "chat", "acc": None}
+                    for _ in range(2):
+                        yield {
+                            "type": "event",
+                            "event": {
+                                "type": "delta",
+                                "phase": "thinking_summary",
+                                "content": "### 比较小数\n\n先对齐小数位，再比较。",
+                                "reasoning_snapshot": True,
+                            },
+                        }
+                    yield {
+                        "type": "event",
+                        "event": {
+                            "type": "delta",
+                            "phase": "answer",
+                            "content": "9.9",
+                        },
+                    }
+
+            request = StandardRequest(
+                prompt="hello",
+                response_model="qwen-3.6plus-thinking",
+                resolved_model="qwen3.6-plus",
+                surface="openai",
+                thinking_enabled=True,
+            )
+            streamed: list[str] = []
+
+            async def on_delta(evt, text_chunk, _tool_calls):
+                if evt.get("phase") == "thinking_summary" and text_chunk:
+                    streamed.append(text_chunk)
+
+            result = await collect_completion_run(
+                FakeClient(),
+                request,
+                request.prompt,
+                capture_events=False,
+                on_delta=on_delta,
+            )
+
+            self.assertEqual(result.state.reasoning_text.count("先对齐小数位"), 1)
+            self.assertEqual("".join(streamed).count("先对齐小数位"), 1)
+            self.assertEqual(result.state.answer_text, "9.9")
 
         asyncio.run(run_case())
 

@@ -35,6 +35,16 @@ async def _reacquire_bound_account_if_needed(*, client, standard_request: Standa
         standard_request.bound_account = None
 
 
+async def _flush_account_chat_pool_if_needed(*, client, execution) -> None:
+    acc = getattr(execution, "acc", None)
+    email = getattr(acc, "email", None)
+    if not email:
+        return
+    pool = getattr(getattr(client, "executor", None), "chat_id_pool", None)
+    if pool is not None:
+        await pool.flush_account(email)
+
+
 async def run_completion_bridge(
     *,
     client,
@@ -101,6 +111,8 @@ async def run_retryable_completion_bridge(
         )
         if retry.retry:
             preserve_chat = bool(getattr(standard_request, 'persistent_session', False))
+            if retry.reason and "empty_upstream_response" in retry.reason:
+                await _flush_account_chat_pool_if_needed(client=client, execution=execution)
             await cleanup_runtime_resources(client, execution.acc, execution.chat_id, preserve_chat=preserve_chat)
 
             reused_persistent_chat = bool(getattr(standard_request, 'persistent_session', False) and getattr(standard_request, 'upstream_chat_id', None))

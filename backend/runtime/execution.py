@@ -489,6 +489,7 @@ async def collect_completion_run(
     acc = None
     answer_fragments: list[str] = []
     reasoning_fragments: list[str] = []
+    reasoning_snapshot_text = ""
     native_tool_calls: list[dict[str, Any]] = []
     tool_state = StreamingToolCallState()
     emitted_visible_output = False
@@ -496,6 +497,9 @@ async def collect_completion_run(
     raw_events: list[dict[str, Any]] = []
     metrics = StreamMetrics()
     inline_thinking_splitter = InlineThinkingMarkdownSplitter(bool(getattr(request, "thinking_enabled", None)))
+    phase_event_counts: dict[str, int] = {}
+    phase_content_chars: dict[str, int] = {}
+    phase_first_preview: dict[str, str] = {}
 
     # 初始化 Tool Sieve 用于实时检测
     tool_sieve = None
@@ -519,8 +523,12 @@ async def collect_completion_run(
         ]
 
     def _finalize_result(*, reason: str | None = None) -> RuntimeExecutionResult:
+        nonlocal reasoning_snapshot_text
         answer_text = "".join(answer_fragments)
         reasoning_text = "".join(reasoning_fragments)
+        if reasoning_snapshot_text and reasoning_snapshot_text not in reasoning_text:
+            separator = "\n" if reasoning_text else ""
+            reasoning_text = f"{reasoning_text}{separator}{reasoning_snapshot_text}"
         inline_split = InlineThinkingMarkdownSplitter.split_complete(answer_text)
         if inline_split and getattr(request, "thinking_enabled", None):
             inline_reasoning, inline_answer = inline_split
@@ -633,6 +641,14 @@ async def collect_completion_run(
                 pass
 
         if reason:
+            if getattr(request, "thinking_enabled", None):
+                log.info(
+                    "[收集完成] phase统计 会话=%s events=%s chars=%s previews=%s",
+                    chat_id,
+                    phase_event_counts,
+                    phase_content_chars,
+                    {phase: preview[:120] for phase, preview in phase_first_preview.items()},
+                )
             log.info(
                 "[收集完成] 原因=%s 会话=%s 工具调用=%s 答复字数=%s 推理字数=%s 结束原因=%s",
                 reason,
@@ -656,8 +672,27 @@ async def collect_completion_run(
         return RuntimeExecutionResult(state=state, chat_id=chat_id, acc=acc)
 
     async def _handle_reasoning_delta(evt: dict[str, Any], content: str) -> RuntimeExecutionResult | None:
-        nonlocal emitted_visible_output, first_event_marked
+        nonlocal emitted_visible_output, first_event_marked, reasoning_snapshot_text
         if not content:
+            return None
+
+        if evt.get("reasoning_snapshot"):
+            if content == reasoning_snapshot_text:
+                return None
+            if content.startswith(reasoning_snapshot_text):
+                client_reasoning_chunks = [content[len(reasoning_snapshot_text):]]
+            else:
+                client_reasoning_chunks = [content]
+            reasoning_snapshot_text = content
+            client_reasoning_chunks = [chunk for chunk in client_reasoning_chunks if chunk]
+            if client_reasoning_chunks:
+                emitted_visible_output = True
+                if not first_event_marked:
+                    metrics.mark("first_event", float(len(raw_events)))
+                    first_event_marked = True
+                if on_delta is not None:
+                    for client_reasoning in client_reasoning_chunks:
+                        await on_delta(evt, client_reasoning, None)
             return None
 
         client_reasoning_chunks = [content]
@@ -824,6 +859,11 @@ async def collect_completion_run(
 
         phase = evt.get("phase", "")
         content = evt.get("content", "")
+        phase_key = phase or "unknown"
+        phase_event_counts[phase_key] = phase_event_counts.get(phase_key, 0) + 1
+        phase_content_chars[phase_key] = phase_content_chars.get(phase_key, 0) + len(content or "")
+        if content and phase_key not in phase_first_preview:
+            phase_first_preview[phase_key] = content
 
         if phase in ("think", "thinking_summary") and content:
             result = await _handle_reasoning_delta(evt, content)

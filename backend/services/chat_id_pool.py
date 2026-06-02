@@ -82,22 +82,26 @@ class ChatIdPool:
             except (asyncio.CancelledError, Exception):
                 pass
 
+    def _key(self, email: str, model: str | None = None) -> str:
+        return f"{email}::{model or self._default_model}"
+
     async def acquire(self, email: str, model: str | None = None) -> Optional[str]:
         """优先从预热池取 chat_id；池空或过期则返回 None（调用方走同步 create_chat）。"""
         if not email:
             return None
+        key = self._key(email, model)
         async with self._lock:
-            q = self._queues.get(email)
+            q = self._queues.get(key)
             if not q:
                 return None
             now = time.time()
             while q:
                 entry = q.popleft()
                 if now - entry.created_at < self._ttl:
-                    log.debug(f"[ChatIdPool] HIT email={email} chat_id={entry.chat_id}")
+                    log.debug(f"[ChatIdPool] HIT email={email} model={model or self._default_model} chat_id={entry.chat_id}")
                     return entry.chat_id
                 # 过期就丢弃继续找下一个
-                log.debug(f"[ChatIdPool] expired chat_id={entry.chat_id} email={email}")
+                log.debug(f"[ChatIdPool] expired chat_id={entry.chat_id} email={email} model={model or self._default_model}")
             return None
 
     async def _prewarm_one(self, account, model: str) -> None:
@@ -108,11 +112,12 @@ class ChatIdPool:
             if not token:
                 log.warning(f"[ChatIdPool] prewarm skipped email={email}: missing token")
                 return
-            chat_id = await self._client.executor.create_chat(token, model)
+            chat_id = await self._client.executor.create_chat(token, model, use_prewarm_pool=False)
             async with self._lock:
-                q = self._queues.setdefault(email, deque())
+                key = self._key(email, model)
+                q = self._queues.setdefault(key, deque())
                 q.append(_Entry(chat_id))
-                log.info(f"[ChatIdPool] prewarmed email={email} chat_id={chat_id} pool_size={len(q)}")
+                log.info(f"[ChatIdPool] prewarmed email={email} model={model} chat_id={chat_id} pool_size={len(q)}")
         except Exception as e:
             # Make sure empty-string exceptions still show class name
             err = str(e) or type(e).__name__
@@ -142,7 +147,7 @@ class ChatIdPool:
 
         for acc in valid:
             async with self._lock:
-                q_size = len(self._queues.get(acc.email, []))
+                q_size = len(self._queues.get(self._key(acc.email, self._default_model), []))
             deficit = self._target - q_size
             # 每轮每账号最多补 1 个，避免突发 API 压力
             if deficit > 0:
@@ -155,12 +160,14 @@ class ChatIdPool:
         if not email or not chat_id:
             return
         async with self._lock:
-            q = self._queues.get(email)
-            if not q:
-                return
-            remaining = deque(e for e in q if e.chat_id != chat_id)
-            self._queues[email] = remaining
-            if len(remaining) != len(q):
+            removed = 0
+            for key, q in list(self._queues.items()):
+                if not key.startswith(f"{email}::"):
+                    continue
+                remaining = deque(e for e in q if e.chat_id != chat_id)
+                removed += len(q) - len(remaining)
+                self._queues[key] = remaining
+            if removed:
                 log.info(f"[ChatIdPool] invalidated email={email} chat_id={chat_id}")
 
     async def flush_account(self, email: str) -> int:
@@ -169,18 +176,19 @@ class ChatIdPool:
         if not email:
             return 0
         async with self._lock:
-            q = self._queues.get(email)
-            if not q:
-                return 0
-            n = len(q)
-            self._queues[email] = deque()
+            n = 0
+            for key, q in list(self._queues.items()):
+                if not key.startswith(f"{email}::"):
+                    continue
+                n += len(q)
+                self._queues[key] = deque()
             if n:
                 log.info(f"[ChatIdPool] flushed {n} entries for email={email}")
             return n
 
     async def size(self, email: str) -> int:
         async with self._lock:
-            return len(self._queues.get(email, []))
+            return sum(len(q) for key, q in self._queues.items() if key.startswith(f"{email}::"))
 
     async def total_size(self) -> int:
         async with self._lock:

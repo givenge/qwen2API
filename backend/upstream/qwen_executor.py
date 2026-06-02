@@ -20,10 +20,17 @@ class QwenExecutor:
         # 会在 app 启动时被 main.py 注入；若未注入则为 None，走同步 create_chat
         self.chat_id_pool = None
 
-    async def create_chat(self, token: str, model: str, chat_type: str = "t2t") -> str:
+    async def create_chat(
+        self,
+        token: str,
+        model: str,
+        chat_type: str = "t2t",
+        *,
+        use_prewarm_pool: bool = True,
+    ) -> str:
         # 预热池快路径：如果能从池里拿到一个已预建的 chat_id 直接用
         # 需要 token 反查 email（通过 account_pool）
-        if self.chat_id_pool is not None and self.account_pool is not None:
+        if use_prewarm_pool and self.chat_id_pool is not None and self.account_pool is not None:
             try:
                 acc = next((a for a in self.account_pool.accounts if a.token == token), None)
                 if acc is not None:
@@ -112,6 +119,8 @@ class QwenExecutor:
         first_event_logged = False
         last_chunk_time = time.perf_counter()
         total_output_chars = 0  # 方案4：统计输出字符数
+        parsed_event_count = 0
+        first_chunk_preview = ""
 
         prompt_len = len(content)
         feature_config = (((payload.get("messages") or [{}])[0]).get("feature_config") or {})
@@ -133,9 +142,12 @@ class QwenExecutor:
                 if "chunk" in chunk_result:
                     buffer += chunk_result["chunk"]
                     total_output_chars += len(chunk_result["chunk"])
+                    if not first_chunk_preview:
+                        first_chunk_preview = chunk_result["chunk"][:200]
                     while "\n\n" in buffer:
                         msg, buffer = buffer.split("\n\n", 1)
                         for evt in parse_sse_chunk(msg):
+                            parsed_event_count += 1
                             if not first_event_logged:
                                 first_event_logged = True
                                 log.info(
@@ -154,6 +166,7 @@ class QwenExecutor:
 
         if buffer:
             for evt in parse_sse_chunk(buffer):
+                parsed_event_count += 1
                 if not first_event_logged:
                     first_event_logged = True
                     log.info(
@@ -167,7 +180,35 @@ class QwenExecutor:
             log.warning(f"[上游] 异常短回复 仅 {total_output_chars} 字符 耗时 {elapsed:.1f}s — 疑似上游超时")
             raise Exception(f"Upstream timeout suspected: only {total_output_chars} chars in {elapsed:.1f}s")
 
-        log.info(f"[上游] 流结束 会话={chat_id} 总耗时={elapsed:.3f}s 流字节={total_output_chars}")
+        if parsed_event_count == 0:
+            preview = first_chunk_preview.replace("\n", "\\n")[:200]
+            try:
+                error_obj = json.loads(first_chunk_preview)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                error_obj = None
+            if isinstance(error_obj, dict) and error_obj.get("success") is False:
+                data = error_obj.get("data") if isinstance(error_obj.get("data"), dict) else {}
+                code = data.get("code") or "upstream_error"
+                details = data.get("details") or error_obj.get("message") or "unknown upstream error"
+                log.warning(
+                    "[上游] 非SSE错误 会话=%s 模型=%s code=%s details=%s",
+                    chat_id,
+                    model,
+                    code,
+                    details,
+                )
+                raise Exception(f"upstream error {code}: {details}")
+            log.warning(
+                "[上游] 空SSE事件 会话=%s 模型=%s 流字节=%s 耗时=%.3fs 预览=%r",
+                chat_id,
+                model,
+                total_output_chars,
+                elapsed,
+                preview,
+            )
+            raise Exception(f"empty upstream SSE events: {total_output_chars} bytes")
+
+        log.info(f"[上游] 流结束 会话={chat_id} 总耗时={elapsed:.3f}s 流字节={total_output_chars} 事件={parsed_event_count}")
 
     async def chat_stream_events_with_retry(
         self,
@@ -183,6 +224,7 @@ class QwenExecutor:
         if fixed_account is not None:
             update_request_context(upstream_attempt=1)
             acc = fixed_account
+            chat_id = None
             try:
                 log.info(f"[上游] 使用指定账号 账号={acc.email} 模型={model}")
                 chat_id = existing_chat_id or await self.create_chat(acc.token, model)
@@ -195,8 +237,14 @@ class QwenExecutor:
                 async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files, thinking_enabled=thinking_enabled):
                     yield {"type": "event", "event": evt}
                 return
-            except Exception:
-                self.account_pool.release(acc)
+            except Exception as e:
+                err_msg = str(e).lower()
+                if chat_id and not existing_chat_id:
+                    await self._delete_chat_best_effort(acc.token, chat_id)
+                if "empty upstream sse events" in err_msg and self.chat_id_pool is not None:
+                    await self.chat_id_pool.flush_account(acc.email)
+                if self.account_pool is not None:
+                    self.account_pool.release(acc)
                 raise
 
         for attempt in range(settings.MAX_RETRIES):
@@ -207,6 +255,7 @@ class QwenExecutor:
             if not acc:
                 raise Exception("No available accounts in pool (all busy or rate limited)")
 
+            chat_id = None
             try:
                 create_start = time.perf_counter()
                 chat_id = await self.create_chat(acc.token, model)
@@ -227,6 +276,15 @@ class QwenExecutor:
                     or "readtimeout" in err_msg
                     or type(e).__name__ in ("ReadTimeout", "TimeoutError", "TimeoutException")
                 )
+                is_empty_sse = "empty upstream sse events" in err_msg
+
+                if chat_id:
+                    await self._delete_chat_best_effort(acc.token, chat_id)
+                if is_empty_sse and self.chat_id_pool is not None:
+                    await self.chat_id_pool.flush_account(acc.email)
+                if "model not found" in err_msg or "not_found" in err_msg:
+                    self.account_pool.release(acc)
+                    raise
 
                 if is_timeout:
                     log.warning(f"[上游] 超时 第{attempt + 1}/{settings.MAX_RETRIES}次 账号={acc.email} 错误={e}")
@@ -250,3 +308,14 @@ class QwenExecutor:
                 )
 
         raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")
+
+    async def _delete_chat_best_effort(self, token: str, chat_id: str | None) -> None:
+        if not token or not chat_id:
+            return
+        delete_fn = getattr(self.engine, "delete_chat", None)
+        if delete_fn is None:
+            return
+        try:
+            await delete_fn(token, chat_id)
+        except Exception as e:
+            log.debug("[上游] 删除失败 会话=%s 错误=%s", chat_id, e)

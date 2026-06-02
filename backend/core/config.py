@@ -124,14 +124,15 @@ MODEL_MAP = {
     "qwen-turbo":        "qwen3.5-flash",
     "qwen-3.6plus":      "qwen3.6-plus",
     "qwen3.6plus":       "qwen3.6-plus",
-    "qwen-3.7max":       "qwen3.7-max-preview",
-    "qwen3.7max":        "qwen3.7-max-preview",
-    "qwen3.7-max":       "qwen3.7-max-preview",
+    "qwen-3.7max":       "qwen3.7-max",
+    "qwen3.7max":        "qwen3.7-max",
+    "qwen3.7-max":       "qwen3.7-max",
     # DeepSeek
     "deepseek-chat":     "qwen3.6-plus",
     "deepseek-reasoner": "qwen3.6-plus",
-    "qwen3.7-max-preview": "qwen3.7-max-preview",
-    "qwen3.7-plus-preview": "qwen3.7-plus-preview",
+    "qwen3.7-max-preview": "qwen3.7-max",
+    "qwen3.7-plus-preview": "qwen3.7-plus",
+    "qwen3.7-plus": "qwen3.7-plus",
 }
 
 

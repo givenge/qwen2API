@@ -157,38 +157,44 @@ async def chat_completions(request: Request):
 
                         async def run_bridge():
                             nonlocal execution, directive, assistant_message, final_finish_reason
-                            result = await run_retryable_completion_bridge(
-                                client=client,
-                                standard_request=standard_request,
-                                prompt=prompt,
-                                users_db=users_db,
-                                token=token,
-                                history_messages=history_messages,
-                                max_attempts=request_max_attempts(standard_request),
-                                usage_delta_factory=build_usage_delta_factory(prompt),
-                                allow_after_visible_output=True,
-                                capture_events=False,
-                                on_delta=on_delta,
-                            )
-                            execution = result.execution
-                            directive = result.directive or build_tool_directive(standard_request, execution.state)
-                            assistant_message = build_openai_assistant_history_message(
-                                execution=execution,
-                                request=standard_request,
-                                directive=directive,
-                            )
-                            await persist_session_turn(
-                                app=app,
-                                request=standard_request,
-                                surface="openai",
-                                execution=execution,
-                                assistant_message=assistant_message,
-                            )
-                            final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else execution.state.finish_reason
-                            # 调用 finalize 以处理任何剩余的工具调用等
-                            translator.finalize(final_finish_reason, directive=directive)
-                            # 放入哨兵值
-                            await queue.put(None)
+                            try:
+                                result = await run_retryable_completion_bridge(
+                                    client=client,
+                                    standard_request=standard_request,
+                                    prompt=prompt,
+                                    users_db=users_db,
+                                    token=token,
+                                    history_messages=history_messages,
+                                    max_attempts=request_max_attempts(standard_request),
+                                    usage_delta_factory=build_usage_delta_factory(prompt),
+                                    allow_after_visible_output=True,
+                                    capture_events=False,
+                                    on_delta=on_delta,
+                                )
+                                execution = result.execution
+                                directive = result.directive or build_tool_directive(standard_request, execution.state)
+                                assistant_message = build_openai_assistant_history_message(
+                                    execution=execution,
+                                    request=standard_request,
+                                    directive=directive,
+                                )
+                                await persist_session_turn(
+                                    app=app,
+                                    request=standard_request,
+                                    surface="openai",
+                                    execution=execution,
+                                    assistant_message=assistant_message,
+                                )
+                                final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else execution.state.finish_reason
+                                # 调用 finalize 以处理任何剩余的工具调用等
+                                translator.finalize(final_finish_reason, directive=directive)
+                            except Exception as e:
+                                await clear_invalidated_session_chat(app=app, request=standard_request)
+                                await queue.put(f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n")
+                                await queue.put("data: [DONE]\n\n")
+                            finally:
+                                # 放入哨兵值，确保客户端连接一定能结束
+                                await queue.put(None)
 
                         execution = None
                         directive = None
