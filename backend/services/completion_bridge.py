@@ -5,7 +5,14 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from backend.adapter.standard_request import StandardRequest
-from backend.runtime.execution import build_tool_directive, cleanup_runtime_resources, collect_completion_run, evaluate_retry_directive
+from backend.runtime.execution import (
+    build_tool_directive,
+    cleanup_runtime_resources,
+    collect_completion_run,
+    empty_completion_reason,
+    evaluate_retry_directive,
+    is_empty_completion_state,
+)
 from backend.services.auth_quota import add_used_tokens
 from backend.services.task_session import build_retry_rebase_prompt
 from backend.services.token_calc import calculate_usage
@@ -106,6 +113,11 @@ async def run_retryable_completion_bridge(
                 await asyncio.sleep(0.05)
             await _reacquire_bound_account_if_needed(client=client, standard_request=standard_request)
             continue
+
+        if is_empty_completion_state(execution.state):
+            preserve_chat = bool(getattr(standard_request, 'persistent_session', False))
+            await cleanup_runtime_resources(client, execution.acc, execution.chat_id, preserve_chat=preserve_chat)
+            raise RuntimeError(f"{empty_completion_reason(execution.state)} after {attempt_index + 1} attempts")
 
         usage = calculate_usage(current_prompt, execution.state.answer_text)
         usage_delta = usage_delta_factory(execution, current_prompt) if usage_delta_factory is not None else usage["total_tokens"]

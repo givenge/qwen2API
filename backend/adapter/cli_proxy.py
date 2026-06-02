@@ -6,7 +6,7 @@ import logging
 from typing import Any
 
 from backend.adapter.standard_request import StandardRequest, CLAUDE_CODE_OPENAI_PROFILE
-from backend.core.config import resolve_model
+from backend.core.config import resolve_model_config
 from backend.services.prompt_builder import messages_to_prompt
 from backend.toolcall.normalize import build_tool_name_registry
 
@@ -32,6 +32,7 @@ class CLIProxy:
             StandardRequest: 统一的标准请求对象
         """
         model_name = req_data.get("model", "gpt-4o")
+        model_resolution = resolve_model_config(model_name)
         prompt_result = messages_to_prompt(req_data, client_profile=client_profile)
 
         tools = prompt_result.tools
@@ -44,7 +45,7 @@ class CLIProxy:
         return StandardRequest(
             prompt=prompt_result.prompt,
             response_model=model_name,
-            resolved_model=resolve_model(model_name),
+            resolved_model=model_resolution.resolved_model,
             surface="openai",
             client_profile=client_profile,
             requested_model=model_name,
@@ -53,6 +54,8 @@ class CLIProxy:
             tool_names=tool_names,
             tool_name_registry=build_tool_name_registry(tool_names),
             tool_enabled=prompt_result.tool_enabled,
+            thinking_enabled=model_resolution.thinking_enabled,
+            model_thinking_enabled=model_resolution.thinking_enabled,
         )
 
     @staticmethod
@@ -68,6 +71,7 @@ class CLIProxy:
             StandardRequest: 统一的标准请求对象
         """
         model_name = req_data.get("model", "claude-3-5-sonnet")
+        model_resolution = resolve_model_config(model_name)
         prompt_result = messages_to_prompt(req_data, client_profile=client_profile)
 
         tools = prompt_result.tools
@@ -80,7 +84,7 @@ class CLIProxy:
         return StandardRequest(
             prompt=prompt_result.prompt,
             response_model=model_name,
-            resolved_model=resolve_model(model_name),
+            resolved_model=model_resolution.resolved_model,
             surface="anthropic",
             client_profile=client_profile,
             requested_model=model_name,
@@ -89,6 +93,8 @@ class CLIProxy:
             tool_names=tool_names,
             tool_name_registry=build_tool_name_registry(tool_names),
             tool_enabled=prompt_result.tool_enabled,
+            thinking_enabled=model_resolution.thinking_enabled,
+            model_thinking_enabled=model_resolution.thinking_enabled,
         )
 
     @staticmethod
@@ -106,6 +112,7 @@ class CLIProxy:
         """
         prompt = CLIProxy._extract_gemini_prompt(req_data)
         stream_requested = CLIProxy._is_gemini_stream_request(req_data) if stream is None else stream
+        model_resolution = resolve_model_config(model)
 
         # Gemini 暂不支持工具调用，后续可扩展
         tools = []
@@ -114,7 +121,7 @@ class CLIProxy:
         return StandardRequest(
             prompt=prompt,
             response_model=model,
-            resolved_model=resolve_model(model),
+            resolved_model=model_resolution.resolved_model,
             surface="gemini",
             requested_model=model,
             content=prompt,
@@ -123,6 +130,8 @@ class CLIProxy:
             tool_names=tool_names,
             tool_name_registry={},
             tool_enabled=False,
+            thinking_enabled=model_resolution.thinking_enabled,
+            model_thinking_enabled=model_resolution.thinking_enabled,
         )
 
     @staticmethod

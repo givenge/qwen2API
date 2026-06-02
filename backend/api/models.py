@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from backend.core.config import MODEL_MAP, resolve_model
+from backend.core.config import MODEL_MAP, iter_static_model_ids, resolve_model_config
 from backend.services.auth_quota import resolve_auth_context
 from backend.services.qwen_client import QwenClient
 
@@ -11,12 +11,20 @@ router = APIRouter()
 def _build_model_list_payload() -> dict:
     seen: set[str] = set()
     data: list[dict] = []
-    for model_id in MODEL_MAP:
-        if model_id in seen:
-            continue
-        seen.add(model_id)
-        data.append({"id": model_id, "object": "model", "owned_by": "qwen2api"})
+    _append_static_model_ids(data, seen)
     return {"object": "list", "data": data}
+
+
+def _append_model_id(data: list[dict], seen: set[str], model_id: str, *, owned_by: str = "qwen2api", created: int = 0) -> None:
+    if model_id in seen:
+        return
+    seen.add(model_id)
+    data.append({"id": model_id, "object": "model", "owned_by": owned_by, "created": created})
+
+
+def _append_static_model_ids(data: list[dict], seen: set[str]) -> None:
+    for model_id in iter_static_model_ids():
+        _append_model_id(data, seen, model_id)
 
 
 @router.get("/v1/models")
@@ -33,18 +41,21 @@ async def list_models(request: Request):
 
     if upstream_models:
         data = []
+        seen: set[str] = set()
         for item in upstream_models:
             if not isinstance(item, dict):
                 continue
             model_id = item.get("id") or item.get("model") or item.get("name")
             if not model_id:
                 continue
-            data.append({
-                "id": model_id,
-                "object": "model",
-                "owned_by": item.get("owned_by", "qwen"),
-                "created": item.get("created_at") or 0,
-            })
+            _append_model_id(
+                data,
+                seen,
+                model_id,
+                owned_by=item.get("owned_by", "qwen"),
+                created=item.get("created_at") or 0,
+            )
+        _append_static_model_ids(data, seen)
         return JSONResponse({"object": "list", "data": data})
 
     # 上游不可用时才回退到静态 MODEL_MAP（包含 gpt-4o/claude 等别名）
@@ -53,7 +64,15 @@ async def list_models(request: Request):
 
 @router.get("/v1/models/{model_id}")
 async def get_model(model_id: str):
-    resolved = resolve_model(model_id)
-    if resolved == model_id and model_id not in MODEL_MAP:
+    resolution = resolve_model_config(model_id)
+    if resolution.resolved_model == model_id and model_id not in MODEL_MAP:
         raise HTTPException(status_code=404, detail={"error": {"message": f"Model '{model_id}' not found", "type": "invalid_request_error"}})
-    return JSONResponse({"id": model_id, "object": "model", "owned_by": "qwen2api", "resolved_model": resolved})
+    payload = {
+        "id": model_id,
+        "object": "model",
+        "owned_by": "qwen2api",
+        "resolved_model": resolution.resolved_model,
+    }
+    if resolution.thinking_enabled is not None:
+        payload["thinking_enabled"] = resolution.thinking_enabled
+    return JSONResponse(payload)

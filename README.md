@@ -176,6 +176,17 @@ flowchart LR
 | `gemini-2.5-pro` / `gemini-2.5-flash` / `gemini-1.5-pro` | `qwen3.6-plus` |
 | `deepseek-chat` / `deepseek-reasoner` | `qwen3.6-plus` |
 
+`qwen-3.6plus` 与 `qwen-3.7max` 额外提供固定 thinking 开关的公开模型名：
+
+| 传入模型名 | 实际调用 | thinking |
+|---|---|---|
+| `qwen-3.6plus-thinking` | `qwen3.6-plus` | 开 |
+| `qwen-3.6plus-nonthinking` | `qwen3.6-plus` | 关 |
+| `qwen-3.7max-thinking` | `qwen3.7-max-preview` | 开 |
+| `qwen-3.7max-nonthinking` | `qwen3.7-max-preview` | 关 |
+
+兼容 `-nonthiking` 拼写作为 `-nonthinking` 的别名。
+
 未命中映射表时，默认回退为传入模型名本身；若管理台设置了自定义映射规则，则以配置为准。
 
 ---

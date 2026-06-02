@@ -1,8 +1,8 @@
 import os
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from pydantic_settings import BaseSettings
-from typing import Dict, Set
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -75,6 +75,24 @@ VERSION = "2.0.0"
 
 settings = Settings()
 
+
+@dataclass(frozen=True, slots=True)
+class ModelResolution:
+    resolved_model: str
+    thinking_enabled: bool | None = None
+
+
+_THINKING_VARIANT_SUFFIXES = (
+    ("-non-thinking", False),
+    ("-nonthinking", False),
+    # Backward-compatible typo alias for clients that already used it.
+    ("-nonthiking", False),
+    ("-thinking", True),
+)
+
+_PUBLIC_THINKING_MODEL_BASES = ("qwen-3.6plus", "qwen-3.7max")
+_PUBLIC_THINKING_VARIANT_SUFFIXES = ("thinking", "nonthinking")
+
 # 全局映射
 MODEL_MAP = {
     # OpenAI
@@ -105,6 +123,11 @@ MODEL_MAP = {
     "qwen-max":          "qwen3.6-plus",
     "qwen-plus":         "qwen3.6-plus",
     "qwen-turbo":        "qwen3.5-flash",
+    "qwen-3.6plus":      "qwen3.6-plus",
+    "qwen3.6plus":       "qwen3.6-plus",
+    "qwen-3.7max":       "qwen3.7-max-preview",
+    "qwen3.7max":        "qwen3.7-max-preview",
+    "qwen3.7-max":       "qwen3.7-max-preview",
     # DeepSeek
     "deepseek-chat":     "qwen3.6-plus",
     "deepseek-reasoner": "qwen3.6-plus",
@@ -112,5 +135,42 @@ MODEL_MAP = {
     "qwen3.7-plus-preview": "qwen3.7-plus-preview",
 }
 
+
+def _split_thinking_variant(name: str) -> tuple[str, bool | None]:
+    for suffix, thinking_enabled in _THINKING_VARIANT_SUFFIXES:
+        if not name.endswith(suffix):
+            continue
+        base_name = name[:-len(suffix)]
+        if base_name and (base_name in MODEL_MAP or base_name.startswith("qwen3.")):
+            return base_name, thinking_enabled
+    return name, None
+
+
+def resolve_model_config(name: str) -> ModelResolution:
+    base_name, thinking_enabled = _split_thinking_variant(name)
+    return ModelResolution(
+        resolved_model=MODEL_MAP.get(base_name, base_name),
+        thinking_enabled=thinking_enabled,
+    )
+
+
 def resolve_model(name: str) -> str:
-    return MODEL_MAP.get(name, name)
+    return resolve_model_config(name).resolved_model
+
+
+def iter_static_model_ids(include_thinking_variants: bool = True):
+    seen: set[str] = set()
+    for model_id in MODEL_MAP:
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+        yield model_id
+    if not include_thinking_variants:
+        return
+    for base_model in _PUBLIC_THINKING_MODEL_BASES:
+        for suffix in _PUBLIC_THINKING_VARIANT_SUFFIXES:
+            model_id = f"{base_model}-{suffix}"
+            if model_id in seen:
+                continue
+            seen.add(model_id)
+            yield model_id

@@ -50,6 +50,15 @@ def _build_standard_request(req_data: dict, *, client_profile: str) -> StandardR
     return standard_request
 
 
+def _extract_openai_thinking_enabled(req_data: dict) -> bool | None:
+    thinking_cfg = req_data.get("thinking")
+    if isinstance(thinking_cfg, bool):
+        return thinking_cfg
+    if isinstance(thinking_cfg, dict):
+        return bool(thinking_cfg.get("enabled", True))
+    return None
+
+
 @router.post("/chat/completions")
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -76,12 +85,10 @@ async def chat_completions(request: Request):
     context_prepared = await prepare_context_attachments(app=app, payload=req_data, surface="openai", auth_token=token, client_profile=client_profile, existing_attachments=(preprocessed.attachments if preprocessed is not None else None))
     req_data = context_prepared["payload"]
     standard_request = _build_standard_request(req_data, client_profile=client_profile)
-    # 前端控制 thinking：支持布尔值或对象 {"enabled": true}
-    thinking_cfg = req_data.get("thinking")
-    if isinstance(thinking_cfg, bool):
-        standard_request.thinking_enabled = thinking_cfg
-    elif isinstance(thinking_cfg, dict):
-        standard_request.thinking_enabled = bool(thinking_cfg.get("enabled", True))
+    # 模型名后缀（-thinking/-nonthinking）优先；普通模型仍支持请求体控制。
+    request_thinking_enabled = _extract_openai_thinking_enabled(req_data)
+    if request_thinking_enabled is not None and standard_request.model_thinking_enabled is None:
+        standard_request.thinking_enabled = request_thinking_enabled
     if preprocessed is not None:
         standard_request.attachments = preprocessed.attachments
         standard_request.uploaded_file_ids = preprocessed.uploaded_file_ids

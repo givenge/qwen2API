@@ -7,7 +7,7 @@ import uuid
 
 from backend.adapter.standard_request import StandardRequest
 from backend.adapter.cli_proxy import CLIProxy
-from backend.core.config import resolve_model, settings
+from backend.core.config import settings
 from backend.core.request_logging import new_request_id, request_context, update_request_context
 from backend.runtime import stream_presenter
 from backend.runtime.execution import (
@@ -15,7 +15,9 @@ from backend.runtime.execution import (
     cleanup_runtime_resources,
     collect_completion_run,
     collect_completion_run_with_recovery,
+    empty_completion_reason,
     evaluate_retry_directive,
+    is_empty_completion_state,
     request_max_attempts,
 )
 from backend.services.auth_quota import resolve_auth_context
@@ -139,6 +141,15 @@ def _message_start_event(msg_id: str, model_name: str, prompt: str, answer_text:
     return stream_presenter.anthropic_message_start(msg_id, model_name, _anthropic_usage(prompt, answer_text))
 
 
+def _extract_anthropic_thinking_enabled(payload: dict) -> bool | None:
+    thinking_cfg = payload.get("thinking")
+    if isinstance(thinking_cfg, dict):
+        return thinking_cfg.get("type") == "enabled"
+    if isinstance(thinking_cfg, bool):
+        return thinking_cfg
+    return None
+
+
 async def _run_anthropic_attempt(
     *,
     client: QwenClient,
@@ -159,6 +170,8 @@ async def _run_anthropic_attempt(
         state=execution.state,
         allow_after_visible_output=True,
     )
+    if not retry.retry and is_empty_completion_state(execution.state):
+        raise RuntimeError(f"{empty_completion_reason(execution.state)} after {stream_attempt + 1} attempts")
     return execution, retry
 
 
@@ -242,12 +255,10 @@ async def anthropic_messages(request: Request):
         )
         working_payload = context_prepared["payload"]
         standard_request = _build_standard_request(working_payload)
-        # 前端控制 thinking：Anthropic 格式 {"thinking": {"type": "enabled", "budget_tokens": N}}
-        thinking_cfg = working_payload.get("thinking")
-        if isinstance(thinking_cfg, dict):
-            standard_request.thinking_enabled = thinking_cfg.get("type") == "enabled"
-        elif isinstance(thinking_cfg, bool):
-            standard_request.thinking_enabled = thinking_cfg
+        # 模型名后缀（-thinking/-nonthinking）优先；普通模型仍支持请求体控制。
+        request_thinking_enabled = _extract_anthropic_thinking_enabled(working_payload)
+        if request_thinking_enabled is not None and standard_request.model_thinking_enabled is None:
+            standard_request.thinking_enabled = request_thinking_enabled
         if preprocessed is not None:
             standard_request.attachments = preprocessed.attachments
             standard_request.uploaded_file_ids = preprocessed.uploaded_file_ids
@@ -359,6 +370,8 @@ async def anthropic_messages(request: Request):
                                     current_prompt = retry.next_prompt
                                 await _reacquire_bound_account_if_needed(client=client, standard_request=standard_request)
                                 continue
+                            if is_empty_completion_state(execution.state):
+                                raise RuntimeError(f"{empty_completion_reason(execution.state)} after {stream_attempt + 1} attempts")
 
                             if not stream_state.pending_chunks:
                                 stream_state.pending_chunks.append(_message_start_event(msg_id, model_name, current_prompt, execution.state.answer_text))

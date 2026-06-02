@@ -137,6 +137,7 @@ __all__ = [
     "collect_completion_run",
     "collect_completion_run_with_recovery",
     "continue_after_retry_directive",
+    "empty_completion_reason",
     "evaluate_retry_directive",
     "extract_blocked_tool_names",
     "finalize_anthropic_stream_success",
@@ -144,6 +145,7 @@ __all__ = [
     "has_recent_search_no_results",
     "has_recent_unchanged_read_result",
     "inject_assistant_message",
+    "is_empty_completion_state",
     "native_tool_calls_to_markup",
     "parse_tool_directive_once",
     "plan_runtime_attempts",
@@ -314,6 +316,18 @@ def should_retry_textual_tool_contract(answer_text: str) -> bool:
     return False
 
 
+def is_empty_completion_state(state: RuntimeAttemptState) -> bool:
+    return (
+        not state.answer_text.strip()
+        and not state.tool_calls
+        and state.finish_reason == "stop"
+    )
+
+
+def empty_completion_reason(state: RuntimeAttemptState) -> str:
+    return "reasoning_only_upstream_response" if state.reasoning_text.strip() else "empty_upstream_response"
+
+
 def native_tool_calls_to_markup(tool_calls: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for tool_call in tool_calls:
@@ -446,17 +460,22 @@ async def collect_completion_run(
                     len(answer_text),
                 )
 
-        # 检查空输出
-        if not detected_tool_calls and not answer_text.strip() and not reasoning_text.strip():
-            log.warning(
-                "[收集完成] 上游返回空输出: 原因=%s 会话=%s",
-                reason,
-                chat_id,
-            )
-            # 如果有 reasoning 但没有 visible output，说明模型只输出了思考过程
+        # 检查没有可见 answer 的输出；只有 reasoning 时 OpenAI/Gemini 客户端也常表现为空。
+        if not detected_tool_calls and not answer_text.strip():
             if reasoning_text.strip():
-                log.warning("[收集完成] 模型只返回了推理内容，没有可见输出")
-            # 空响应 flush 该账号池（同批次预热的可能都是坏的），下次走新建
+                log.warning(
+                    "[收集完成] 模型只返回推理内容，没有可见答复: 原因=%s 会话=%s 推理字数=%s",
+                    reason,
+                    chat_id,
+                    len(reasoning_text),
+                )
+            else:
+                log.warning(
+                    "[收集完成] 上游返回空输出: 原因=%s 会话=%s",
+                    reason,
+                    chat_id,
+                )
+            # 无 answer 的响应 flush 该账号池（同批次预热的可能都是坏的），下次走新建
             try:
                 pool = getattr(client, "executor", None) and getattr(client.executor, "chat_id_pool", None)
                 if pool is not None and acc is not None:
@@ -1021,15 +1040,11 @@ def evaluate_retry_directive(
 
     # 空响应重试：上游返回 answer_chars=0 tool_calls=0 finish_reason=stop
     # 典型场景是 Qwen 后端对某个 chat_id 返回空（常见于池化 chat_id 刚建好就被用、
-    # 或 Qwen 服务抖动时）。换账号 + 换新 chat_id 再试一次。
-    if (
-        not state.answer_text
-        and not state.tool_calls
-        and state.finish_reason == "stop"
-        and not state.emitted_visible_output
-    ):
+    # 或 Qwen 服务抖动时）。只有 reasoning 没有 answer 对普通客户端同样等价于空答复。
+    # 换账号 + 换新 chat_id 再试一次。
+    if is_empty_completion_state(state) and (not state.emitted_visible_output or state.reasoning_text.strip()):
         return _retry(
-            "empty_upstream_response",
+            empty_completion_reason(state),
             current_prompt,  # prompt 不变，让上游重新处理
         )
 
