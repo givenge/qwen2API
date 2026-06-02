@@ -323,7 +323,7 @@ export default function AccountsPage() {
               <th className="h-12 px-6 align-middle">{"\u72b6\u6001"}</th>
               <th className="h-12 px-6 align-middle">{"\u5e76\u53d1\u8d1f\u8f7d"}</th>
               <th className="h-12 px-6 align-middle">{"\u8bf4\u660e"}</th>
-              <th className="h-12 px-6 align-middle text-right">{"\u64cd\u4f5c"}</th>
+              <th className="h-12 px-6 align-middle text-right min-w-[260px]">{"\u64cd\u4f5c"}</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border/50">
@@ -355,8 +355,27 @@ export default function AccountsPage() {
                         <MailWarning className="h-4 w-4 mr-1" /> {"\u6fc0\u6d3b"}
                       </Button>
                     )}
-                    <Button variant="outline" size="sm" onClick={() => handleCopyPassword(acc)} disabled={!acc.password} title={acc.password ? "\u590d\u5236\u5bc6\u7801" : "\u672a\u4fdd\u5b58\u5bc6\u7801"}>
-                      {copiedPasswordFor === acc.email ? <Check className="h-4 w-4 text-green-600" /> : <Copy className="h-4 w-4" />}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleCopyPassword(acc)}
+                      disabled={!acc.password}
+                      title={acc.password ? "\u590d\u5236\u5bc6\u7801" : "\u672a\u4fdd\u5b58\u5bc6\u7801"}
+                      className="min-w-[96px]"
+                    >
+                      {copiedPasswordFor === acc.email ? (
+                        <>
+                          <Check className="h-4 w-4 mr-1 text-green-600" /> {"\u5df2\u590d\u5236"}
+                        </>
+                      ) : acc.password ? (
+                        <>
+                          <Copy className="h-4 w-4 mr-1" /> {"\u590d\u5236\u5bc6\u7801"}
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-4 w-4 mr-1" /> {"\u65e0\u5bc6\u7801"}
+                        </>
+                      )}
                     </Button>
                     <Button variant="outline" size="sm" onClick={() => handleVerify(acc.email)} disabled={verifying === acc.email} title={"\u5355\u72ec\u9a8c\u8bc1"}>
                       {verifying === acc.email ? <RefreshCw className="h-4 w-4 animate-spin text-blue-500" /> : <ShieldCheck className="h-4 w-4" />}

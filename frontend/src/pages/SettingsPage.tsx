@@ -5,18 +5,23 @@ import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 
+interface AdminSettings {
+  version?: string
+  max_inflight_per_account?: number
+  global_max_inflight?: number
+  chat_id_pool_target?: number
+  chat_id_pool_ttl_seconds?: number
+  model_aliases?: Record<string, string>
+}
+
 export default function SettingsPage() {
-  const [settings, setSettings] = useState<any>(null)
-  const [sessionKey, setSessionKey] = useState("")
+  const [settings, setSettings] = useState<AdminSettings | null>(null)
+  const [sessionKey, setSessionKey] = useState(() => localStorage.getItem('qwen2api_key') || "")
   const [maxInflight, setMaxInflight] = useState(4)
   const [globalMaxInflight, setGlobalMaxInflight] = useState(0)
   const [poolTarget, setPoolTarget] = useState(5)
   const [poolTtlMin, setPoolTtlMin] = useState(10)
   const [modelAliases, setModelAliases] = useState("")
-
-  const loadSessionKey = () => {
-    setSessionKey(localStorage.getItem('qwen2api_key') || "")
-  }
 
   const fetchSettings = () => {
     fetch(`${API_BASE}/api/admin/settings`, { headers: getAuthHeader() })
@@ -36,7 +41,6 @@ export default function SettingsPage() {
   }
 
   useEffect(() => {
-    loadSessionKey()
     fetchSettings()
   }, [])
 
@@ -95,7 +99,7 @@ export default function SettingsPage() {
         if(res.ok) { toast.success("模型映射规则已更新"); fetchSettings(); }
         else toast.error("保存失败")
       })
-    } catch(e) {
+    } catch {
       toast.error("JSON 格式错误，请检查语法")
     }
   }
@@ -109,7 +113,8 @@ export default function SettingsPage() {
     -d '{
       "model": "qwen3.6-plus",
       "messages": [{"role": "user", "content": "Hello"}],
-      "stream": true
+      "stream": true,
+      "thinking_enabled": true
     }'
 
   # Upload one file first (the response contains a reusable content_block)
@@ -124,6 +129,7 @@ export default function SettingsPage() {
     -d '{
       "model": "qwen3.6-plus",
       "stream": false,
+      "thinking_enabled": true,
       "messages": [
         {
           "role": "user",
@@ -143,6 +149,7 @@ export default function SettingsPage() {
     -d '{
       "model": "claude-sonnet-4-6",
       "max_tokens": 1024,
+      "thinking_enabled": true,
       "messages": [
         {
           "role": "user",

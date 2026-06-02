@@ -3,6 +3,7 @@ from __future__ import annotations
 from backend.adapter.standard_request import StandardRequest
 from backend.core.config import resolve_model_config
 from backend.services.prompt_builder import messages_to_prompt
+from backend.services.thinking_control import extract_request_thinking_enabled
 from backend.toolcall.normalize import build_tool_name_registry
 
 
@@ -10,6 +11,11 @@ def build_chat_standard_request(req_data: dict, *, default_model: str, surface: 
     requested_model = req_data.get("model", default_model)
     model_resolution = resolve_model_config(requested_model)
     prompt_result = messages_to_prompt(req_data, client_profile=client_profile)
+    request_thinking_enabled = (
+        model_resolution.thinking_enabled
+        if model_resolution.thinking_enabled is not None
+        else extract_request_thinking_enabled(req_data)
+    )
     tools = prompt_result.tools
     tool_names = [tool_name for tool_name in (tool.get("name") for tool in tools) if isinstance(tool_name, str) and tool_name]
     return StandardRequest(
@@ -23,6 +29,6 @@ def build_chat_standard_request(req_data: dict, *, default_model: str, surface: 
         tool_names=tool_names,
         tool_name_registry=build_tool_name_registry(tool_names),
         tool_enabled=prompt_result.tool_enabled,
-        thinking_enabled=model_resolution.thinking_enabled,
+        thinking_enabled=request_thinking_enabled,
         model_thinking_enabled=model_resolution.thinking_enabled,
     )

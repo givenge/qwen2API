@@ -25,6 +25,7 @@ from backend.services.context_attachment_manager import prepare_context_attachme
 from backend.services.attachment_preprocessor import preprocess_attachments
 from backend.services.prompt_builder import CLAUDE_CODE_OPENAI_PROFILE, messages_to_prompt
 from backend.services.qwen_client import QwenClient
+from backend.services.thinking_control import extract_request_thinking_enabled
 from backend.services.task_session import (
     build_anthropic_assistant_history_message,
     build_retry_rebase_prompt,
@@ -141,15 +142,6 @@ def _message_start_event(msg_id: str, model_name: str, prompt: str, answer_text:
     return stream_presenter.anthropic_message_start(msg_id, model_name, _anthropic_usage(prompt, answer_text))
 
 
-def _extract_anthropic_thinking_enabled(payload: dict) -> bool | None:
-    thinking_cfg = payload.get("thinking")
-    if isinstance(thinking_cfg, dict):
-        return thinking_cfg.get("type") == "enabled"
-    if isinstance(thinking_cfg, bool):
-        return thinking_cfg
-    return None
-
-
 async def _run_anthropic_attempt(
     *,
     client: QwenClient,
@@ -256,7 +248,7 @@ async def anthropic_messages(request: Request):
         working_payload = context_prepared["payload"]
         standard_request = _build_standard_request(working_payload)
         # 模型名后缀（-thinking/-nonthinking）优先；普通模型仍支持请求体控制。
-        request_thinking_enabled = _extract_anthropic_thinking_enabled(working_payload)
+        request_thinking_enabled = extract_request_thinking_enabled(working_payload)
         if request_thinking_enabled is not None and standard_request.model_thinking_enabled is None:
             standard_request.thinking_enabled = request_thinking_enabled
         if preprocessed is not None:

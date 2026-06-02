@@ -19,6 +19,17 @@ interface GeneratedImage {
   ratio: string
 }
 
+interface ImageGenerationItem {
+  url?: string
+  revised_prompt?: string
+}
+
+interface ImageGenerationResponse {
+  data?: ImageGenerationItem[]
+  detail?: unknown
+  error?: unknown
+}
+
 export default function ImagePage() {
   const [prompt, setPrompt] = useState("")
   const [ratio, setRatio] = useState("1:1")
@@ -48,7 +59,7 @@ export default function ImagePage() {
         }),
       })
 
-      const data = await res.json()
+      const data = await res.json() as ImageGenerationResponse
       if (!res.ok) {
         const detail = data?.detail || data?.error || `HTTP ${res.status}`
         setError(String(detail))
@@ -56,7 +67,9 @@ export default function ImagePage() {
         return
       }
 
-      const newImages: GeneratedImage[] = (data.data || []).map((item: any) => ({
+      const newImages: GeneratedImage[] = (data.data || [])
+        .filter((item): item is ImageGenerationItem & { url: string } => typeof item.url === "string")
+        .map((item) => ({
         url: item.url,
         revised_prompt: item.revised_prompt || prompt,
         ratio,
@@ -70,8 +83,8 @@ export default function ImagePage() {
 
       setImages(prev => [...newImages, ...prev])
       toast.success(`成功生成 ${newImages.length} 张图片`)
-    } catch (err: any) {
-      const msg = err.message || "网络错误"
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "网络错误"
       setError(msg)
       toast.error(`生成失败: ${msg}`)
     } finally {

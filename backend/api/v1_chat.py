@@ -18,6 +18,7 @@ from backend.services.prompt_builder import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW
 from backend.services.response_formatters import build_openai_completion_payload
 from backend.services.qwen_client import QwenClient
 from backend.services.standard_request_builder import build_chat_standard_request
+from backend.services.thinking_control import extract_request_thinking_enabled
 from backend.services.task_session import (
     build_openai_assistant_history_message,
     clear_invalidated_session_chat,
@@ -50,15 +51,6 @@ def _build_standard_request(req_data: dict, *, client_profile: str) -> StandardR
     return standard_request
 
 
-def _extract_openai_thinking_enabled(req_data: dict) -> bool | None:
-    thinking_cfg = req_data.get("thinking")
-    if isinstance(thinking_cfg, bool):
-        return thinking_cfg
-    if isinstance(thinking_cfg, dict):
-        return bool(thinking_cfg.get("enabled", True))
-    return None
-
-
 @router.post("/chat/completions")
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -86,7 +78,7 @@ async def chat_completions(request: Request):
     req_data = context_prepared["payload"]
     standard_request = _build_standard_request(req_data, client_profile=client_profile)
     # 模型名后缀（-thinking/-nonthinking）优先；普通模型仍支持请求体控制。
-    request_thinking_enabled = _extract_openai_thinking_enabled(req_data)
+    request_thinking_enabled = extract_request_thinking_enabled(req_data)
     if request_thinking_enabled is not None and standard_request.model_thinking_enabled is None:
         standard_request.thinking_enabled = request_thinking_enabled
     if preprocessed is not None:

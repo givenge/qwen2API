@@ -28,6 +28,8 @@ from backend.runtime.execution import RuntimeAttemptState, RuntimeToolDirective,
 from backend.services import tool_parser
 from backend.services.openai_stream_translator import OpenAIStreamTranslator
 from backend.services.response_formatters import build_openai_completion_payload
+from backend.services.standard_request_builder import build_chat_standard_request
+from backend.services.thinking_control import extract_request_thinking_enabled
 from backend.toolcall.parser import parse_tool_calls_detailed
 from backend.upstream.payload_builder import build_chat_payload
 
@@ -161,6 +163,34 @@ class ToolCallParserTests(unittest.TestCase):
             thinking_enabled=None,
         )
         self.assertFalse(default_tool_payload["messages"][0]["feature_config"]["thinking_enabled"])
+
+    def test_protocol_thinking_formats_normalize_to_thinking_enabled(self):
+        cases = [
+            ({"thinking_enabled": True}, True),
+            ({"thinking_enabled": False}, False),
+            ({"thinking": {"type": "enabled", "budget_tokens": 1024}}, True),
+            ({"thinking": {"type": "disabled"}}, False),
+            ({"thinking": {"enabled": True}}, True),
+            ({"reasoning": {"effort": "high"}}, True),
+            ({"reasoning_effort": "none"}, False),
+        ]
+        for payload, expected in cases:
+            with self.subTest(payload=payload):
+                self.assertEqual(extract_request_thinking_enabled(payload), expected)
+
+    def test_request_thinking_enabled_uses_model_suffix_priority(self):
+        request = build_chat_standard_request(
+            {
+                "model": "qwen-3.6plus-nonthinking",
+                "thinking_enabled": True,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            default_model="gpt-3.5-turbo",
+            surface="openai",
+        )
+
+        self.assertFalse(request.thinking_enabled)
+        self.assertFalse(request.model_thinking_enabled)
 
     def test_openai_stream_translator_emits_tool_call_delta(self):
         def build_directive(_answer_text):

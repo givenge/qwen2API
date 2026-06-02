@@ -5,6 +5,57 @@ import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 import { toast } from "sonner"
 
+type ApiFormat = "openai" | "anthropic"
+
+interface ChatMessage {
+  role: "user" | "assistant"
+  content: string
+  reasoning?: string
+  error?: boolean
+}
+
+interface OpenAIChatResponse {
+  error?: unknown
+  choices?: Array<{
+    message?: {
+      role?: string
+      content?: string
+      reasoning?: string
+      reasoning_content?: string
+    }
+  }>
+}
+
+interface OpenAIStreamChunk {
+  error?: unknown
+  choices?: Array<{
+    delta?: {
+      content?: string
+      reasoning_content?: string
+    }
+  }>
+}
+
+interface AnthropicMessageResponse {
+  error?: unknown
+  content?: Array<{
+    type?: string
+    text?: string
+    thinking?: string
+    name?: string
+  }>
+}
+
+interface AnthropicStreamEvent {
+  type?: string
+  error?: unknown
+  delta?: {
+    type?: string
+    text?: string
+    thinking?: string
+  }
+}
+
 // 渲染消息内容：自动把 Markdown 图片和图片 URL 渲染成 <img>
 function MessageContent({ content }: { content: string }) {
   type Seg = { start: number; end: number; url: string }
@@ -45,13 +96,45 @@ function MessageContent({ content }: { content: string }) {
   return <div className="whitespace-pre-wrap leading-relaxed">{nodes}</div>
 }
 
+function toAnthropicMessages(messages: ChatMessage[]) {
+  return messages
+    .filter(msg => msg.role === "user" || msg.role === "assistant")
+    .map(msg => ({
+      role: msg.role,
+      content: msg.content || msg.reasoning || "",
+    }))
+}
+
+function extractAnthropicMessage(data: AnthropicMessageResponse): ChatMessage {
+  const contentParts: string[] = []
+  const reasoningParts: string[] = []
+
+  for (const block of data.content || []) {
+    if (block.type === "thinking" && block.thinking) {
+      reasoningParts.push(block.thinking)
+    } else if (block.type === "text" && block.text) {
+      contentParts.push(block.text)
+    } else if (block.type === "tool_use" && block.name) {
+      contentParts.push(`[tool_use:${block.name}]`)
+    }
+  }
+
+  return {
+    role: "assistant",
+    content: contentParts.join(""),
+    reasoning: reasoningParts.join(""),
+  }
+}
+
 export default function TestPage() {
-  const [messages, setMessages] = useState<{ role: string; content: string; reasoning?: string; error?: boolean }[]>([])
+  const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
   const [model, setModel] = useState("qwen3.6-plus")
   const [availableModels, setAvailableModels] = useState<string[]>(["qwen3.6-plus"])
   const [stream, setStream] = useState(true)
+  const [apiFormat, setApiFormat] = useState<ApiFormat>("openai")
+  const [thinkingEnabled, setThinkingEnabled] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -81,35 +164,49 @@ export default function TestPage() {
 
   const handleSend = async () => {
     if (!input.trim() || loading) return
-    const userMsg = { role: "user", content: input }
+    const userMsg: ChatMessage = { role: "user", content: input }
+    const nextMessages = [...messages, userMsg]
     setMessages(prev => [...prev, userMsg])
     setInput("")
     setLoading(true)
 
     try {
       if (!stream) {
-        const res = await fetch(`${API_BASE}/v1/chat/completions`, {
+        const isAnthropic = apiFormat === "anthropic"
+        const res = await fetch(`${API_BASE}${isAnthropic ? "/anthropic/v1/messages" : "/v1/chat/completions"}`, {
           method: "POST",
           headers: { "Content-Type": "application/json", ...getAuthHeader() },
-          body: JSON.stringify({ model, messages: [...messages, userMsg], stream: false })
+          body: JSON.stringify(
+            isAnthropic
+              ? { model, max_tokens: 4096, messages: toAnthropicMessages(nextMessages), stream: false, thinking_enabled: thinkingEnabled }
+              : { model, messages: nextMessages, stream: false, thinking_enabled: thinkingEnabled }
+          )
         })
         const data = await res.json()
         if (data.error) {
           setMessages(prev => [...prev, { role: "assistant", content: `❌ ${data.error}`, error: true }])
-        } else if (data.choices?.[0]) {
-          const message = data.choices[0].message
+        } else if (isAnthropic) {
+          setMessages(prev => [...prev, extractAnthropicMessage(data as AnthropicMessageResponse)])
+        } else if ((data as OpenAIChatResponse).choices?.[0]) {
+          const message = (data as OpenAIChatResponse).choices?.[0]?.message || {}
           setMessages(prev => [...prev, {
-            ...message,
+            role: "assistant",
+            content: message.content || "",
             reasoning: message.reasoning ?? message.reasoning_content ?? "",
           }])
         } else {
           setMessages(prev => [...prev, { role: "assistant", content: `❌ 未知响应: ${JSON.stringify(data)}`, error: true }])
         }
       } else {
-        const res = await fetch(`${API_BASE}/v1/chat/completions`, {
+        const isAnthropic = apiFormat === "anthropic"
+        const res = await fetch(`${API_BASE}${isAnthropic ? "/anthropic/v1/messages" : "/v1/chat/completions"}`, {
           method: "POST",
           headers: { "Content-Type": "application/json", ...getAuthHeader() },
-          body: JSON.stringify({ model, messages: [...messages, userMsg], stream: true })
+          body: JSON.stringify(
+            isAnthropic
+              ? { model, max_tokens: 4096, messages: toAnthropicMessages(nextMessages), stream: true, thinking_enabled: thinkingEnabled }
+              : { model, messages: nextMessages, stream: true, thinking_enabled: thinkingEnabled }
+          )
         })
 
         if (!res.ok) {
@@ -135,7 +232,7 @@ export default function TestPage() {
             if (!line || line.startsWith(":") || line === "data: [DONE]") continue
             if (line.startsWith("data: ")) {
               try {
-                const data = JSON.parse(line.slice(6))
+                const data = JSON.parse(line.slice(6)) as OpenAIStreamChunk | AnthropicStreamEvent
                 if (data.error) {
                   setMessages(prev => {
                     const msgs = [...prev]
@@ -145,8 +242,12 @@ export default function TestPage() {
                   hasContent = true
                   break
                 }
-                const content: string = data.choices?.[0]?.delta?.content ?? ""
-                const reasoning: string = data.choices?.[0]?.delta?.reasoning_content ?? ""
+                const content: string = isAnthropic
+                  ? ((data as AnthropicStreamEvent).delta?.type === "text_delta" ? (data as AnthropicStreamEvent).delta?.text ?? "" : "")
+                  : (data as OpenAIStreamChunk).choices?.[0]?.delta?.content ?? ""
+                const reasoning: string = isAnthropic
+                  ? ((data as AnthropicStreamEvent).delta?.type === "thinking_delta" ? (data as AnthropicStreamEvent).delta?.thinking ?? "" : "")
+                  : (data as OpenAIStreamChunk).choices?.[0]?.delta?.reasoning_content ?? ""
                 if (content || reasoning) {
                   hasContent = true
                   setMessages(prev => {
@@ -160,7 +261,7 @@ export default function TestPage() {
                     return msgs
                   })
                 }
-              } catch (_) { /* skip */ }
+              } catch { /* skip */ }
             }
           }
         }
@@ -173,9 +274,10 @@ export default function TestPage() {
           })
         }
       }
-    } catch (err: any) {
-      toast.error(`网络错误: ${err.message}`)
-      setMessages(prev => [...prev, { role: "assistant", content: `❌ 网络错误: ${err.message}`, error: true }])
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "网络错误"
+      toast.error(`网络错误: ${msg}`)
+      setMessages(prev => [...prev, { role: "assistant", content: `❌ 网络错误: ${msg}`, error: true }])
     } finally {
       setLoading(false)
     }
@@ -188,7 +290,14 @@ export default function TestPage() {
           <h2 className="text-2xl font-bold tracking-tight">接口测试</h2>
           <p className="text-muted-foreground">在此测试您的 API 分发是否正常工作。</p>
         </div>
-        <div className="flex gap-4 items-center">
+          <div className="flex gap-4 items-center">
+          <div className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md">
+            <span className="font-medium text-muted-foreground">协议:</span>
+            <select value={apiFormat} onChange={e => setApiFormat(e.target.value as ApiFormat)} className="bg-transparent font-mono outline-none">
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+            </select>
+          </div>
           <div className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md">
             <span className="font-medium text-muted-foreground">模型:</span>
             <select value={model} onChange={e => setModel(e.target.value)} className="bg-transparent font-mono outline-none">
@@ -197,6 +306,10 @@ export default function TestPage() {
               ))}
             </select>
           </div>
+          <label className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md cursor-pointer">
+            <input type="checkbox" checked={thinkingEnabled} onChange={e => setThinkingEnabled(e.target.checked)} className="cursor-pointer" />
+            <span className="font-medium">Thinking</span>
+          </label>
           <div
             className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md cursor-pointer"
             onClick={() => setStream(!stream)}

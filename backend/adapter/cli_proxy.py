@@ -8,6 +8,7 @@ from typing import Any
 from backend.adapter.standard_request import StandardRequest, CLAUDE_CODE_OPENAI_PROFILE
 from backend.core.config import resolve_model_config
 from backend.services.prompt_builder import messages_to_prompt
+from backend.services.thinking_control import extract_request_thinking_enabled
 from backend.toolcall.normalize import build_tool_name_registry
 
 log = logging.getLogger("qwen2api.cli_proxy")
@@ -34,6 +35,11 @@ class CLIProxy:
         model_name = req_data.get("model", "gpt-4o")
         model_resolution = resolve_model_config(model_name)
         prompt_result = messages_to_prompt(req_data, client_profile=client_profile)
+        request_thinking_enabled = (
+            model_resolution.thinking_enabled
+            if model_resolution.thinking_enabled is not None
+            else extract_request_thinking_enabled(req_data)
+        )
 
         tools = prompt_result.tools
         tool_names = [
@@ -54,7 +60,7 @@ class CLIProxy:
             tool_names=tool_names,
             tool_name_registry=build_tool_name_registry(tool_names),
             tool_enabled=prompt_result.tool_enabled,
-            thinking_enabled=model_resolution.thinking_enabled,
+            thinking_enabled=request_thinking_enabled,
             model_thinking_enabled=model_resolution.thinking_enabled,
         )
 
@@ -73,6 +79,11 @@ class CLIProxy:
         model_name = req_data.get("model", "claude-3-5-sonnet")
         model_resolution = resolve_model_config(model_name)
         prompt_result = messages_to_prompt(req_data, client_profile=client_profile)
+        request_thinking_enabled = (
+            model_resolution.thinking_enabled
+            if model_resolution.thinking_enabled is not None
+            else extract_request_thinking_enabled(req_data)
+        )
 
         tools = prompt_result.tools
         tool_names = [
@@ -93,7 +104,7 @@ class CLIProxy:
             tool_names=tool_names,
             tool_name_registry=build_tool_name_registry(tool_names),
             tool_enabled=prompt_result.tool_enabled,
-            thinking_enabled=model_resolution.thinking_enabled,
+            thinking_enabled=request_thinking_enabled,
             model_thinking_enabled=model_resolution.thinking_enabled,
         )
 
