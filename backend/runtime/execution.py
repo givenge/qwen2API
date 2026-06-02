@@ -35,8 +35,109 @@ _TOXIC_REFUSAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_INLINE_THINKING_START_RE = re.compile(
+    r"^\s*#{1,6}\s*(?:思考过程|思考|推理过程|Thinking|Reasoning)\s*\n+",
+    re.IGNORECASE,
+)
+_INLINE_FINAL_ANSWER_RE = re.compile(
+    r"(?:^|\n)\s*#{1,6}\s*(?:最终答案|最终回答|答案|Final\s+Answer|Answer)\s*\n+",
+    re.IGNORECASE,
+)
+_INLINE_THINKING_PREFIXES = (
+    "# 思考",
+    "## 思考",
+    "# 思考过程",
+    "## 思考过程",
+    "# 推理过程",
+    "## 推理过程",
+    "# Thinking",
+    "## Thinking",
+    "# Reasoning",
+    "## Reasoning",
+)
+
 
 log = logging.getLogger("qwen2api.runtime")
+
+
+class InlineThinkingMarkdownSplitter:
+    """Split Qwen markdown thinking sections emitted as answer-phase text."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.mode = "detect"
+        self.buffer = ""
+
+    @staticmethod
+    def _could_be_thinking_prefix(text: str) -> bool:
+        stripped = text.lstrip()
+        if not stripped:
+            return True
+        return any(prefix.startswith(stripped) for prefix in _INLINE_THINKING_PREFIXES)
+
+    @staticmethod
+    def split_complete(text: str) -> tuple[str, str] | None:
+        start_match = _INLINE_THINKING_START_RE.match(text)
+        if not start_match:
+            return None
+        final_match = _INLINE_FINAL_ANSWER_RE.search(text, start_match.end())
+        if not final_match:
+            return None
+        reasoning = text[start_match.end():final_match.start()]
+        answer = text[final_match.end():]
+        return reasoning, answer
+
+    def process(self, text: str) -> list[tuple[str, str]]:
+        if not self.enabled or not text:
+            return [("answer", text)] if text else []
+
+        if self.mode == "answer":
+            return [("answer", text)]
+
+        self.buffer += text
+
+        if self.mode == "detect":
+            start_match = _INLINE_THINKING_START_RE.match(self.buffer)
+            if start_match:
+                self.mode = "reasoning"
+                self.buffer = self.buffer[start_match.end():]
+                return self._drain_reasoning()
+
+            if len(self.buffer) < 48 and self._could_be_thinking_prefix(self.buffer):
+                return []
+
+            plain = self.buffer
+            self.buffer = ""
+            self.mode = "answer"
+            return [("answer", plain)]
+
+        return self._drain_reasoning()
+
+    def _drain_reasoning(self) -> list[tuple[str, str]]:
+        final_match = _INLINE_FINAL_ANSWER_RE.search(self.buffer)
+        if not final_match:
+            return []
+
+        reasoning = self.buffer[:final_match.start()]
+        answer = self.buffer[final_match.end():]
+        self.buffer = ""
+        self.mode = "answer"
+        chunks: list[tuple[str, str]] = []
+        if reasoning:
+            chunks.append(("thinking_summary", reasoning))
+        if answer:
+            chunks.append(("answer", answer))
+        return chunks
+
+    def flush(self) -> list[tuple[str, str]]:
+        if not self.buffer:
+            return []
+        buffered = self.buffer
+        self.buffer = ""
+        if self.mode == "reasoning":
+            return [("thinking_summary", buffered)]
+        self.mode = "answer"
+        return [("answer", buffered)]
 
 
 @dataclass(slots=True)
@@ -394,6 +495,7 @@ async def collect_completion_run(
     first_event_marked = False
     raw_events: list[dict[str, Any]] = []
     metrics = StreamMetrics()
+    inline_thinking_splitter = InlineThinkingMarkdownSplitter(bool(getattr(request, "thinking_enabled", None)))
 
     # 初始化 Tool Sieve 用于实时检测
     tool_sieve = None
@@ -419,6 +521,11 @@ async def collect_completion_run(
     def _finalize_result(*, reason: str | None = None) -> RuntimeExecutionResult:
         answer_text = "".join(answer_fragments)
         reasoning_text = "".join(reasoning_fragments)
+        inline_split = InlineThinkingMarkdownSplitter.split_complete(answer_text)
+        if inline_split and getattr(request, "thinking_enabled", None):
+            inline_reasoning, inline_answer = inline_split
+            reasoning_text = f"{reasoning_text}{inline_reasoning}"
+            answer_text = inline_answer
         if native_tool_calls and not answer_text:
             answer_text = native_tool_calls_to_markup(native_tool_calls)
 
@@ -548,6 +655,149 @@ async def collect_completion_run(
         )
         return RuntimeExecutionResult(state=state, chat_id=chat_id, acc=acc)
 
+    async def _handle_reasoning_delta(evt: dict[str, Any], content: str) -> RuntimeExecutionResult | None:
+        nonlocal emitted_visible_output, first_event_marked
+        if not content:
+            return None
+
+        client_reasoning_chunks = [content]
+        if reasoning_tool_sieve:
+            client_reasoning_chunks = []
+            sieve_events = reasoning_tool_sieve.process_chunk(content)
+            for sieve_evt in sieve_events:
+                if sieve_evt.get("type") == "tool_calls":
+                    calls = sieve_evt.get("calls", [])
+                    if calls:
+                        for client_reasoning in client_reasoning_chunks:
+                            reasoning_fragments.append(client_reasoning)
+                            if on_delta is not None:
+                                await on_delta(evt, client_reasoning, None)
+                        if client_reasoning_chunks:
+                            emitted_visible_output = True
+                        if not first_event_marked:
+                            metrics.mark("first_event", float(len(raw_events)))
+                            first_event_marked = True
+                        native_tool_calls.extend(_tool_blocks_from_sieve_calls(calls))
+                        log.info(
+                            "[Collect] ✓ 推理 Tool Sieve 实时检测到工具调用: tools=%s",
+                            [c.get("name") for c in native_tool_calls],
+                        )
+                        return _finalize_result(reason="reasoning_tool_sieve_detected")
+                elif sieve_evt.get("type") == "content":
+                    safe_reasoning = sieve_evt.get("text", "")
+                    if safe_reasoning:
+                        client_reasoning_chunks.append(safe_reasoning)
+
+        for client_reasoning in client_reasoning_chunks:
+            reasoning_fragments.append(client_reasoning)
+        if client_reasoning_chunks:
+            emitted_visible_output = True
+        if not first_event_marked:
+            metrics.mark("first_event", float(len(raw_events)))
+            first_event_marked = True
+        if on_delta is not None:
+            for client_reasoning in client_reasoning_chunks:
+                await on_delta(evt, client_reasoning, None)
+        return None
+
+    async def _handle_answer_delta(evt: dict[str, Any], content: str) -> RuntimeExecutionResult | None:
+        nonlocal emitted_visible_output, first_event_marked
+        if not content:
+            return None
+
+        answer_fragments.append(content)
+
+        # 毒性拒绝早期拦截：Qwen 偶尔幻觉出 "Tool X does not exists." 之类文本。
+        # 在标记 emitted_visible_output 之前识别并提前 finalize，让 evaluate_retry_directive
+        # 的 blocked_tool_name 分支能正常触发重试（否则 emitted=True 后就不 retry 了）。
+        if (
+            request.tools
+            and not emitted_visible_output
+            and len("".join(answer_fragments)) >= 20
+        ):
+            early_answer = "".join(answer_fragments).strip()
+            if _TOXIC_REFUSAL_RE.search(early_answer):
+                toxic_blocked = extract_blocked_tool_names(early_answer, request.tool_names)
+                blocked_name = toxic_blocked[0] if toxic_blocked else "unknown"
+                log.warning(
+                    "[收集完成] 污染拦截 %r (未流出客户端，触发重试)",
+                    early_answer[:80],
+                )
+                return _finalize_result(reason=f"blocked_tool_name:{blocked_name}")
+
+        emitted_visible_output = True
+        if not first_event_marked:
+            metrics.mark("first_event", float(len(raw_events)))
+            first_event_marked = True
+
+        client_text_chunks = [content]
+
+        # Tool Sieve 需要看到连续 chunk 才能识别被拆开的工具标记。
+        # 当启用时，只把它判定安全的 content 片段流给客户端，避免半截 marker 泄露。
+        if tool_sieve:
+            client_text_chunks = []
+            sieve_events = tool_sieve.process_chunk(content)
+            for sieve_evt in sieve_events:
+                if sieve_evt.get("type") == "tool_calls":
+                    # 检测到工具调用！
+                    calls = sieve_evt.get("calls", [])
+                    if calls:
+                        detected_calls = _tool_blocks_from_sieve_calls(calls)
+                        native_tool_calls.extend(detected_calls)
+                        log.info(
+                            "[Collect] ✓ Tool Sieve 实时检测到工具调用: tools=%s",
+                            [c.get("name") for c in detected_calls],
+                        )
+                        return _finalize_result(reason="tool_sieve_detected")
+                elif sieve_evt.get("type") == "content":
+                    safe_text = sieve_evt.get("text", "")
+                    if safe_text:
+                        client_text_chunks.append(safe_text)
+
+        if request.tools:
+            answer_text = "".join(answer_fragments)
+            # 降低检测频率：每 8 个 chunk 检测一次 blocked tool（而非每 3 个）
+            # "does not exist" 关键字仍做即时检测
+            if len(answer_fragments) % 8 == 0 or "does not exist" in content.lower():
+                blocked_tool_names = extract_blocked_tool_names(answer_text.strip(), request.tool_names)
+                if blocked_tool_names:
+                    return _finalize_result(reason=f"blocked_tool_name:{blocked_tool_names[0]}")
+            # 仅在文本包含工具标记时才做解析
+            if "##TOOL_CALL##" in answer_text or "<tool_call>" in answer_text:
+                directive = parse_tool_directive_once(
+                    request,
+                    RuntimeAttemptState(answer_text=answer_text, reasoning_text="".join(reasoning_fragments)),
+                )
+                if directive.stop_reason == "tool_use":
+                    return _finalize_result(reason="textual_tool_use")
+        if on_delta is not None:
+            for client_text in client_text_chunks:
+                await on_delta(evt, client_text, None)
+        return None
+
+    async def _handle_inline_answer_delta(evt: dict[str, Any], content: str) -> RuntimeExecutionResult | None:
+        for chunk_phase, chunk_text in inline_thinking_splitter.process(content):
+            routed_evt = {**evt, "phase": chunk_phase}
+            if chunk_phase in ("think", "thinking_summary"):
+                result = await _handle_reasoning_delta(routed_evt, chunk_text)
+            else:
+                result = await _handle_answer_delta(routed_evt, chunk_text)
+            if result is not None:
+                return result
+        return None
+
+    async def _flush_inline_thinking(evt: dict[str, Any] | None = None) -> RuntimeExecutionResult | None:
+        base_evt = evt or {"type": "delta", "phase": "answer"}
+        for chunk_phase, chunk_text in inline_thinking_splitter.flush():
+            routed_evt = {**base_evt, "phase": chunk_phase}
+            if chunk_phase in ("think", "thinking_summary"):
+                result = await _handle_reasoning_delta(routed_evt, chunk_text)
+            else:
+                result = await _handle_answer_delta(routed_evt, chunk_text)
+            if result is not None:
+                return result
+        return None
+
     async for item in client.chat_stream_events_with_retry(
         request.resolved_model,
         prompt,
@@ -576,115 +826,15 @@ async def collect_completion_run(
         content = evt.get("content", "")
 
         if phase in ("think", "thinking_summary") and content:
-            client_reasoning_chunks = [content]
-            if reasoning_tool_sieve:
-                client_reasoning_chunks = []
-                sieve_events = reasoning_tool_sieve.process_chunk(content)
-                for sieve_evt in sieve_events:
-                    if sieve_evt.get("type") == "tool_calls":
-                        calls = sieve_evt.get("calls", [])
-                        if calls:
-                            for client_reasoning in client_reasoning_chunks:
-                                reasoning_fragments.append(client_reasoning)
-                                if on_delta is not None:
-                                    await on_delta(evt, client_reasoning, None)
-                            if client_reasoning_chunks:
-                                emitted_visible_output = True
-                            if not first_event_marked:
-                                metrics.mark("first_event", float(len(raw_events)))
-                                first_event_marked = True
-                            native_tool_calls.extend(_tool_blocks_from_sieve_calls(calls))
-                            log.info(
-                                "[Collect] ✓ 推理 Tool Sieve 实时检测到工具调用: tools=%s",
-                                [c.get("name") for c in native_tool_calls],
-                            )
-                            return _finalize_result(reason="reasoning_tool_sieve_detected")
-                    elif sieve_evt.get("type") == "content":
-                        safe_reasoning = sieve_evt.get("text", "")
-                        if safe_reasoning:
-                            client_reasoning_chunks.append(safe_reasoning)
-
-            for client_reasoning in client_reasoning_chunks:
-                reasoning_fragments.append(client_reasoning)
-            if client_reasoning_chunks:
-                emitted_visible_output = True
-            if not first_event_marked:
-                metrics.mark("first_event", float(len(raw_events)))
-                first_event_marked = True
-            if on_delta is not None:
-                for client_reasoning in client_reasoning_chunks:
-                    await on_delta(evt, client_reasoning, None)
+            result = await _handle_reasoning_delta(evt, content)
+            if result is not None:
+                return result
             continue
 
         if phase == "answer" and content:
-            answer_fragments.append(content)
-
-            # 毒性拒绝早期拦截：Qwen 偶尔幻觉出 "Tool X does not exists." 之类文本。
-            # 在标记 emitted_visible_output 之前识别并提前 finalize，让 evaluate_retry_directive
-            # 的 blocked_tool_name 分支能正常触发重试（否则 emitted=True 后就不 retry 了）。
-            if (
-                request.tools
-                and not emitted_visible_output
-                and len("".join(answer_fragments)) >= 20
-            ):
-                early_answer = "".join(answer_fragments).strip()
-                if _TOXIC_REFUSAL_RE.search(early_answer):
-                    toxic_blocked = extract_blocked_tool_names(early_answer, request.tool_names)
-                    blocked_name = toxic_blocked[0] if toxic_blocked else "unknown"
-                    log.warning(
-                        "[收集完成] 污染拦截 %r (未流出客户端，触发重试)",
-                        early_answer[:80],
-                    )
-                    return _finalize_result(reason=f"blocked_tool_name:{blocked_name}")
-
-            emitted_visible_output = True
-            if not first_event_marked:
-                metrics.mark("first_event", float(len(raw_events)))
-                first_event_marked = True
-
-            client_text_chunks = [content]
-
-            # Tool Sieve 需要看到连续 chunk 才能识别被拆开的工具标记。
-            # 当启用时，只把它判定安全的 content 片段流给客户端，避免半截 marker 泄露。
-            if tool_sieve:
-                client_text_chunks = []
-                sieve_events = tool_sieve.process_chunk(content)
-                for sieve_evt in sieve_events:
-                    if sieve_evt.get("type") == "tool_calls":
-                        # 检测到工具调用！
-                        calls = sieve_evt.get("calls", [])
-                        if calls:
-                            detected_calls = _tool_blocks_from_sieve_calls(calls)
-                            native_tool_calls.extend(detected_calls)
-                            log.info(
-                                "[Collect] ✓ Tool Sieve 实时检测到工具调用: tools=%s",
-                                [c.get("name") for c in detected_calls],
-                            )
-                            return _finalize_result(reason="tool_sieve_detected")
-                    elif sieve_evt.get("type") == "content":
-                        safe_text = sieve_evt.get("text", "")
-                        if safe_text:
-                            client_text_chunks.append(safe_text)
-
-            if request.tools:
-                answer_text = "".join(answer_fragments)
-                # 降低检测频率：每 8 个 chunk 检测一次 blocked tool（而非每 3 个）
-                # "does not exist" 关键字仍做即时检测
-                if len(answer_fragments) % 8 == 0 or "does not exist" in content.lower():
-                    blocked_tool_names = extract_blocked_tool_names(answer_text.strip(), request.tool_names)
-                    if blocked_tool_names:
-                        return _finalize_result(reason=f"blocked_tool_name:{blocked_tool_names[0]}")
-                # 仅在文本包含工具标记时才做解析
-                if "##TOOL_CALL##" in answer_text or "<tool_call>" in answer_text:
-                    directive = parse_tool_directive_once(
-                        request,
-                        RuntimeAttemptState(answer_text=answer_text, reasoning_text="".join(reasoning_fragments)),
-                    )
-                    if directive.stop_reason == "tool_use":
-                        return _finalize_result(reason="textual_tool_use")
-            if on_delta is not None:
-                for client_text in client_text_chunks:
-                    await on_delta(evt, client_text, None)
+            result = await _handle_inline_answer_delta(evt, content)
+            if result is not None:
+                return result
             continue
 
         if phase == "tool_call":
@@ -699,6 +849,9 @@ async def collect_completion_run(
                     await on_delta(evt, None, completed_calls)
                 return _finalize_result(reason="native_tool_use")
 
+    flushed_result = await _flush_inline_thinking()
+    if flushed_result is not None:
+        return flushed_result
     return _finalize_result(reason="stream_end")
 
 

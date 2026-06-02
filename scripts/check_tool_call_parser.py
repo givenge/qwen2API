@@ -279,6 +279,55 @@ class ToolCallParserTests(unittest.TestCase):
         self.assertEqual(message["content"], "final answer")
         self.assertEqual(message["reasoning_content"], "reasoning summary")
 
+    def test_answer_phase_markdown_thinking_is_split_into_reasoning(self):
+        async def run_case():
+            class FakeClient:
+                async def chat_stream_events_with_retry(self, *args, **kwargs):
+                    yield {"type": "meta", "chat_id": "chat", "acc": None}
+                    for content in (
+                        "## 思考过程\n\n",
+                        "先比较小数位。",
+                        "\n\n## 最终答案\n\n",
+                        "9.9",
+                    ):
+                        yield {
+                            "type": "event",
+                            "event": {
+                                "type": "delta",
+                                "phase": "answer",
+                                "content": content,
+                            },
+                        }
+
+            request = StandardRequest(
+                prompt="hello",
+                response_model="qwen-3.6plus-thinking",
+                resolved_model="qwen3.6-plus",
+                surface="openai",
+                thinking_enabled=True,
+            )
+            streamed: list[tuple[str, str]] = []
+
+            async def on_delta(evt, text_chunk, _tool_calls):
+                if text_chunk:
+                    streamed.append((evt.get("phase"), text_chunk))
+
+            result = await collect_completion_run(
+                FakeClient(),
+                request,
+                request.prompt,
+                capture_events=False,
+                on_delta=on_delta,
+            )
+
+            self.assertIn("先比较小数位", result.state.reasoning_text)
+            self.assertEqual(result.state.answer_text, "9.9")
+            self.assertEqual(streamed[0][0], "thinking_summary")
+            self.assertIn("先比较小数位", streamed[0][1])
+            self.assertEqual(streamed[-1], ("answer", "9.9"))
+
+        asyncio.run(run_case())
+
     def test_reasoning_tool_call_marker_is_not_streamed_to_client(self):
         async def run_case():
             class FakeClient:
