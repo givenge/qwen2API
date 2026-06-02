@@ -194,7 +194,7 @@ async def chat_completions(request: Request):
                             )
                             final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else execution.state.finish_reason
                             # 调用 finalize 以处理任何剩余的工具调用等
-                            translator.finalize(final_finish_reason)
+                            translator.finalize(final_finish_reason, directive=directive)
                             # 放入哨兵值
                             await queue.put(None)
 

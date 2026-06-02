@@ -114,7 +114,11 @@ class QwenExecutor:
         total_output_chars = 0  # 方案4：统计输出字符数
 
         prompt_len = len(content)
-        log.info(f"[上游] 开始流式 会话={chat_id} 模型={model} 工具={has_custom_tools} prompt={prompt_len}B")
+        feature_config = (((payload.get("messages") or [{}])[0]).get("feature_config") or {})
+        log.info(
+            f"[上游] 开始流式 会话={chat_id} 模型={model} 工具={has_custom_tools} "
+            f"thinking={feature_config.get('thinking_enabled')} prompt={prompt_len}B"
+        )
 
         try:
             async for chunk_result in stream_fn(token, chat_id, payload):

@@ -399,7 +399,22 @@ async def collect_completion_run(
     tool_sieve = None
     if request.tools:
         tool_sieve = tool_parser.ToolSieve(request.tool_names)
+        reasoning_tool_sieve = tool_parser.ToolSieve(request.tool_names)
         log.info("[收集完成] 工具过滤器已启用，工具列表: %s", request.tool_names)
+    else:
+        reasoning_tool_sieve = None
+
+    def _tool_blocks_from_sieve_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        import uuid
+        return [
+            {
+                "type": "tool_use",
+                "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                "name": call["name"],
+                "input": call["input"],
+            }
+            for call in calls
+        ]
 
     def _finalize_result(*, reason: str | None = None) -> RuntimeExecutionResult:
         answer_text = "".join(answer_fragments)
@@ -419,13 +434,7 @@ async def collect_completion_run(
                     calls = evt.get("calls", [])
                     if calls:
                         # 转换为标准格式
-                        import uuid
-                        detected_tool_calls = [{
-                            "type": "tool_use",
-                            "id": f"toolu_{uuid.uuid4().hex[:8]}",
-                            "name": call["name"],
-                            "input": call["input"]
-                        } for call in calls]
+                        detected_tool_calls = _tool_blocks_from_sieve_calls(calls)
                         final_finish_reason = "tool_calls"
                         log.info(
                             "[Collect] ✓ Tool Sieve 刷新检测到工具调用: tools=%s",
@@ -435,6 +444,25 @@ async def collect_completion_run(
                 elif evt.get("type") == "content":
                     # 剩余文本内容
                     pass
+
+        if reasoning_tool_sieve and not detected_tool_calls:
+            flush_events = reasoning_tool_sieve.flush()
+            for evt in flush_events:
+                if evt.get("type") == "tool_calls":
+                    calls = evt.get("calls", [])
+                    if calls:
+                        detected_tool_calls = _tool_blocks_from_sieve_calls(calls)
+                        final_finish_reason = "tool_calls"
+                        log.info(
+                            "[Collect] ✓ 推理 Tool Sieve 刷新检测到工具调用: tools=%s",
+                            [t.get("name") for t in detected_tool_calls],
+                        )
+                        break
+                elif evt.get("type") == "content":
+                    safe_reasoning = evt.get("text", "")
+                    if safe_reasoning:
+                        reasoning_fragments.append(safe_reasoning)
+            reasoning_text = "".join(reasoning_fragments)
 
         # 第二重：解析最终文本
         if not detected_tool_calls and request.tools and answer_text:
@@ -458,6 +486,19 @@ async def collect_completion_run(
                     "[Collect] ✓ 最终文本解析检测到工具调用: tools=%s, cleaned_text_len=%s",
                     [t.get("name") for t in detected_tool_calls],
                     len(answer_text),
+                )
+
+        # thinking 模式下 Qwen 有时把工具调用标记放进 reasoning phase。
+        # 当没有 answer 时，把 reasoning 中的工具调用提升为正式 tool_use。
+        if not detected_tool_calls and request.tools and not answer_text.strip() and reasoning_text:
+            tool_blocks, stop_reason = tool_parser.parse_tool_calls_silent(reasoning_text, request.tools)
+            tool_use_blocks = [b for b in tool_blocks if b.get("type") == "tool_use"]
+            if tool_use_blocks and stop_reason == "tool_use":
+                detected_tool_calls = tool_use_blocks
+                final_finish_reason = "tool_calls"
+                log.info(
+                    "[Collect] ✓ 推理文本解析检测到工具调用: tools=%s",
+                    [t.get("name") for t in detected_tool_calls],
                 )
 
         # 检查没有可见 answer 的输出；只有 reasoning 时 OpenAI/Gemini 客户端也常表现为空。
@@ -535,13 +576,44 @@ async def collect_completion_run(
         content = evt.get("content", "")
 
         if phase in ("think", "thinking_summary") and content:
-            reasoning_fragments.append(content)
-            emitted_visible_output = True
+            client_reasoning_chunks = [content]
+            if reasoning_tool_sieve:
+                client_reasoning_chunks = []
+                sieve_events = reasoning_tool_sieve.process_chunk(content)
+                for sieve_evt in sieve_events:
+                    if sieve_evt.get("type") == "tool_calls":
+                        calls = sieve_evt.get("calls", [])
+                        if calls:
+                            for client_reasoning in client_reasoning_chunks:
+                                reasoning_fragments.append(client_reasoning)
+                                if on_delta is not None:
+                                    await on_delta(evt, client_reasoning, None)
+                            if client_reasoning_chunks:
+                                emitted_visible_output = True
+                            if not first_event_marked:
+                                metrics.mark("first_event", float(len(raw_events)))
+                                first_event_marked = True
+                            native_tool_calls.extend(_tool_blocks_from_sieve_calls(calls))
+                            log.info(
+                                "[Collect] ✓ 推理 Tool Sieve 实时检测到工具调用: tools=%s",
+                                [c.get("name") for c in native_tool_calls],
+                            )
+                            return _finalize_result(reason="reasoning_tool_sieve_detected")
+                    elif sieve_evt.get("type") == "content":
+                        safe_reasoning = sieve_evt.get("text", "")
+                        if safe_reasoning:
+                            client_reasoning_chunks.append(safe_reasoning)
+
+            for client_reasoning in client_reasoning_chunks:
+                reasoning_fragments.append(client_reasoning)
+            if client_reasoning_chunks:
+                emitted_visible_output = True
             if not first_event_marked:
                 metrics.mark("first_event", float(len(raw_events)))
                 first_event_marked = True
             if on_delta is not None:
-                await on_delta(evt, content, None)
+                for client_reasoning in client_reasoning_chunks:
+                    await on_delta(evt, client_reasoning, None)
             continue
 
         if phase == "answer" and content:
@@ -582,13 +654,7 @@ async def collect_completion_run(
                         # 检测到工具调用！
                         calls = sieve_evt.get("calls", [])
                         if calls:
-                            import uuid
-                            detected_calls = [{
-                                "type": "tool_use",
-                                "id": f"toolu_{uuid.uuid4().hex[:8]}",
-                                "name": call["name"],
-                                "input": call["input"]
-                            } for call in calls]
+                            detected_calls = _tool_blocks_from_sieve_calls(calls)
                             native_tool_calls.extend(detected_calls)
                             log.info(
                                 "[Collect] ✓ Tool Sieve 实时检测到工具调用: tools=%s",

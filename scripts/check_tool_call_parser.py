@@ -1,12 +1,35 @@
 import unittest
+import asyncio
 from pathlib import Path
 import sys
+import types
+from types import SimpleNamespace
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+try:
+    import pydantic_settings  # noqa: F401
+except ModuleNotFoundError:
+    pydantic_settings = types.ModuleType("pydantic_settings")
+
+    class BaseSettings:
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    pydantic_settings.BaseSettings = BaseSettings
+    sys.modules["pydantic_settings"] = pydantic_settings
+
+from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE
+from backend.adapter.standard_request import StandardRequest
+from backend.core.config import resolve_model_config
+from backend.runtime.execution import RuntimeAttemptState, RuntimeToolDirective, collect_completion_run
 from backend.services import tool_parser
+from backend.services.openai_stream_translator import OpenAIStreamTranslator
+from backend.services.response_formatters import build_openai_completion_payload
 from backend.toolcall.parser import parse_tool_calls_detailed
+from backend.upstream.payload_builder import build_chat_payload
 
 
 TOOLS = [
@@ -104,6 +127,180 @@ class ToolCallParserTests(unittest.TestCase):
 
         self.assertEqual(events, [{"type": "tool_calls", "calls": [{"name": "Bash", "input": {"command": "ls -la"}}]}])
 
+    def test_qwen_thinking_variant_resolution(self):
+        cases = {
+            "qwen-3.6plus-thinking": ("qwen3.6-plus", True),
+            "qwen-3.6plus-nonthinking": ("qwen3.6-plus", False),
+            "qwen-3.6plus-nonthiking": ("qwen3.6-plus", False),
+            "qwen-3.7max-thinking": ("qwen3.7-max-preview", True),
+            "qwen-3.7max-nonthinking": ("qwen3.7-max-preview", False),
+        }
+        for model, expected in cases.items():
+            with self.subTest(model=model):
+                resolution = resolve_model_config(model)
+                self.assertEqual((resolution.resolved_model, resolution.thinking_enabled), expected)
+
+    def test_explicit_thinking_survives_tool_mode(self):
+        payload = build_chat_payload(
+            "chat",
+            "qwen3.6-plus",
+            "hello",
+            has_custom_tools=True,
+            thinking_enabled=True,
+        )
+        feature_config = payload["messages"][0]["feature_config"]
+        self.assertTrue(feature_config["thinking_enabled"])
+        self.assertTrue(feature_config["auto_thinking"])
+        self.assertEqual(feature_config["thinking_mode"], "Auto")
+
+        default_tool_payload = build_chat_payload(
+            "chat",
+            "qwen3.6-plus",
+            "hello",
+            has_custom_tools=True,
+            thinking_enabled=None,
+        )
+        self.assertFalse(default_tool_payload["messages"][0]["feature_config"]["thinking_enabled"])
+
+    def test_openai_stream_translator_emits_tool_call_delta(self):
+        def build_directive(_answer_text):
+            return RuntimeToolDirective(
+                tool_blocks=[
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_test",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/a.txt"},
+                    }
+                ],
+                stop_reason="tool_use",
+            )
+
+        translator = OpenAIStreamTranslator(
+            completion_id="chatcmpl-test",
+            created=1,
+            model_name="qwen-3.6plus-nonthinking",
+            client_profile=CLAUDE_CODE_OPENAI_PROFILE,
+            build_final_directive=build_directive,
+            allowed_tool_names=["Read"],
+        )
+        translator.on_delta(
+            {"phase": "answer"},
+            '##TOOL_CALL##\n{"name":"Read","input":{"file_path":"/tmp/a.txt"}}\n##END_CALL##',
+            None,
+        )
+
+        output = "".join(translator.finalize("tool_calls"))
+        self.assertIn('"tool_calls"', output)
+        self.assertIn('"finish_reason": "tool_calls"', output)
+        self.assertNotIn("##TOOL_CALL##", output)
+
+    def test_openai_stream_translator_uses_runtime_final_directive(self):
+        translator = OpenAIStreamTranslator(
+            completion_id="chatcmpl-test",
+            created=1,
+            model_name="qwen-3.6plus-thinking",
+            client_profile=CLAUDE_CODE_OPENAI_PROFILE,
+            build_final_directive=lambda _answer_text: RuntimeToolDirective(),
+            allowed_tool_names=["Read"],
+        )
+        runtime_directive = RuntimeToolDirective(
+            tool_blocks=[
+                {
+                    "type": "tool_use",
+                    "id": "toolu_runtime",
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/from-runtime.txt"},
+                }
+            ],
+            stop_reason="tool_use",
+        )
+
+        output = "".join(translator.finalize("tool_calls", directive=runtime_directive))
+        self.assertIn('"tool_calls"', output)
+        self.assertIn("toolu_runtime", output)
+        self.assertIn("/tmp/from-runtime.txt", output)
+        self.assertIn('"finish_reason": "tool_calls"', output)
+
+    def test_openai_non_stream_response_preserves_reasoning_content(self):
+        request = StandardRequest(
+            prompt="hello",
+            response_model="qwen-3.6plus-thinking",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+        )
+        execution = SimpleNamespace(
+            state=RuntimeAttemptState(
+                answer_text="final answer",
+                reasoning_text="reasoning summary",
+            )
+        )
+
+        payload = build_openai_completion_payload(
+            completion_id="chatcmpl-test",
+            created=1,
+            model_name=request.response_model,
+            prompt=request.prompt,
+            execution=execution,
+            standard_request=request,
+        )
+
+        message = payload["choices"][0]["message"]
+        self.assertEqual(message["content"], "final answer")
+        self.assertEqual(message["reasoning_content"], "reasoning summary")
+
+    def test_reasoning_tool_call_marker_is_not_streamed_to_client(self):
+        async def run_case():
+            class FakeClient:
+                async def chat_stream_events_with_retry(self, *args, **kwargs):
+                    yield {"type": "meta", "chat_id": "chat", "acc": None}
+                    yield {
+                        "type": "event",
+                        "event": {
+                            "type": "delta",
+                            "phase": "think",
+                            "content": "checking\n##TOOL_CALL##\n",
+                        },
+                    }
+                    yield {
+                        "type": "event",
+                        "event": {
+                            "type": "delta",
+                            "phase": "think",
+                            "content": '{"name":"Read","input":{"file_path":"/tmp/a.txt"}}',
+                        },
+                    }
+
+            request = StandardRequest(
+                prompt="hello",
+                response_model="qwen-3.6plus-thinking",
+                resolved_model="qwen3.6-plus",
+                surface="openai",
+                tools=TOOLS,
+                tool_names=["Read", "Bash"],
+                tool_enabled=True,
+                thinking_enabled=True,
+            )
+            streamed: list[str] = []
+
+            async def on_delta(_evt, text_chunk, _tool_calls):
+                if text_chunk:
+                    streamed.append(text_chunk)
+
+            result = await collect_completion_run(
+                FakeClient(),
+                request,
+                request.prompt,
+                capture_events=False,
+                on_delta=on_delta,
+            )
+
+            self.assertEqual([call["name"] for call in result.state.tool_calls], ["Read"])
+            self.assertEqual(result.state.tool_calls[0]["input"], {"file_path": "/tmp/a.txt"})
+            self.assertEqual("".join(streamed), "checking\n")
+            self.assertNotIn("##TOOL_CALL##", "".join(streamed))
+
+        asyncio.run(run_case())
 
 if __name__ == "__main__":
     unittest.main()

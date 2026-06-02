@@ -97,7 +97,11 @@ export default function TestPage() {
         if (data.error) {
           setMessages(prev => [...prev, { role: "assistant", content: `❌ ${data.error}`, error: true }])
         } else if (data.choices?.[0]) {
-          setMessages(prev => [...prev, data.choices[0].message])
+          const message = data.choices[0].message
+          setMessages(prev => [...prev, {
+            ...message,
+            reasoning: message.reasoning ?? message.reasoning_content ?? "",
+          }])
         } else {
           setMessages(prev => [...prev, { role: "assistant", content: `❌ 未知响应: ${JSON.stringify(data)}`, error: true }])
         }

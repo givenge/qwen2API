@@ -172,12 +172,18 @@ class OpenAIStreamTranslator:
         if tool_calls:
             self.tool_calls_emitted = True
 
-    def finalize(self, finish_reason: str) -> list[str]:
+    def finalize(self, finish_reason: str, directive: RuntimeToolDirective | None = None) -> list[str]:
         final_finish_reason = finish_reason
         buffered_text = "".join(self.buffered_toolish_fragments)
-        if self.build_final_directive is not None and not self.tool_calls_emitted:
-            directive = self.build_final_directive("".join(self.answer_fragments))
-            if self._should_finalize_tool_calls(directive):
+        final_directive = directive
+        if final_directive is None and self.build_final_directive is not None:
+            final_directive = self.build_final_directive("".join(self.answer_fragments))
+
+        if final_directive is not None and not self.tool_calls_emitted:
+            should_emit_tool_calls = self._should_finalize_tool_calls(final_directive)
+            if directive is not None and finish_reason == "tool_calls" and final_directive.stop_reason == "tool_use":
+                should_emit_tool_calls = True
+            if should_emit_tool_calls:
                 self._discard_pending_content_chunks()
                 tool_calls = [
                     {
@@ -185,7 +191,7 @@ class OpenAIStreamTranslator:
                         "name": block["name"],
                         "input": block.get("input", {}),
                     }
-                    for block in directive.tool_blocks
+                    for block in final_directive.tool_blocks
                     if block.get("type") == "tool_use"
                 ]
                 if tool_calls:

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react"
 import { Button } from "../components/ui/button"
-import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning } from "lucide-react"
+import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning, Copy, Check } from "lucide-react"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
@@ -76,6 +76,7 @@ export default function AccountsPage() {
   const [registerUnlocked, setRegisterUnlocked] = useState(false)
   const [verifying, setVerifying] = useState<string | null>(null)
   const [verifyingAll, setVerifyingAll] = useState(false)
+  const [copiedPasswordFor, setCopiedPasswordFor] = useState<string | null>(null)
 
   // 邮箱+密码字段同时匹配时解锁注册功能
   useEffect(() => {
@@ -154,6 +155,21 @@ export default function AccountsPage() {
       toast.success(`\u5df2\u5220\u9664 ${targetEmail}`, { id })
       fetchAccounts()
     }).catch(() => toast.error("\u5220\u9664\u8d26\u53f7\u5931\u8d25", { id }))
+  }
+
+  const handleCopyPassword = async (acc: AccountItem) => {
+    if (!acc.password) {
+      toast.warning(`账号 ${acc.email} 没有保存密码`)
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(acc.password)
+      setCopiedPasswordFor(acc.email)
+      toast.success(`已复制 ${acc.email} 的密码`)
+      setTimeout(() => setCopiedPasswordFor(current => current === acc.email ? null : current), 2000)
+    } catch {
+      toast.error("复制失败，请检查浏览器剪贴板权限")
+    }
   }
 
   const handleAutoRegister = () => {
@@ -339,6 +355,9 @@ export default function AccountsPage() {
                         <MailWarning className="h-4 w-4 mr-1" /> {"\u6fc0\u6d3b"}
                       </Button>
                     )}
+                    <Button variant="outline" size="sm" onClick={() => handleCopyPassword(acc)} disabled={!acc.password} title={acc.password ? "\u590d\u5236\u5bc6\u7801" : "\u672a\u4fdd\u5b58\u5bc6\u7801"}>
+                      {copiedPasswordFor === acc.email ? <Check className="h-4 w-4 text-green-600" /> : <Copy className="h-4 w-4" />}
+                    </Button>
                     <Button variant="outline" size="sm" onClick={() => handleVerify(acc.email)} disabled={verifying === acc.email} title={"\u5355\u72ec\u9a8c\u8bc1"}>
                       {verifying === acc.email ? <RefreshCw className="h-4 w-4 animate-spin text-blue-500" /> : <ShieldCheck className="h-4 w-4" />}
                     </Button>

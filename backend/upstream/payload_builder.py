@@ -18,11 +18,12 @@ _BASE_FEATURE_CONFIG = {
 
 def build_chat_payload(chat_id: str, model: str, content: str, has_custom_tools: bool = False, files: list[dict] | None = None, thinking_enabled: bool | None = None) -> dict:
     ts = int(time.time())
-    # thinking 优先级：工具请求强制关闭 > 前端显式值 > 全局默认
-    if has_custom_tools:
-        effective_thinking = False
-    elif thinking_enabled is not None:
+    # thinking 优先级：模型/请求显式值 > 工具请求默认关闭 > 全局默认。
+    # 工具请求默认关闭是为了稳定本地工具解析；但 thinking 版本模型必须能显式打开。
+    if thinking_enabled is not None:
         effective_thinking = thinking_enabled
+    elif has_custom_tools:
+        effective_thinking = False
     else:
         effective_thinking = _THINKING_ENABLED
     feature_config = {
